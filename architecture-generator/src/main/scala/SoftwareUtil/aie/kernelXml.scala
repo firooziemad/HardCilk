@@ -101,16 +101,17 @@ object KernelXmlTemplate {
           .toSeq
           .sortBy(out => (outputPortPriority(out.portType), out.portType))
 
-        if (!isNonLastEndpoint || ordered.size <= 1) {
-          Seq.empty
-        } else {
-          val widths = ordered.map(_.bitWidth)
-          Seq(
+        val groups =
+          if (isNonLastEndpoint && ordered.size > 1) Seq(ordered)
+          else if (ordered.size > 2) ordered.grouped(2).filter(_.size > 1).toSeq
+          else Seq.empty
+
+        groups.map { group =>
+          val widths = group.map(_.bitWidth)
             StreamSplitterXmlDef(
               kernelName = s"StreamSplitter_${widths.mkString("_")}",
               outputWidths = widths
             )
-          )
         }
       }
       .distinctBy(_.kernelName)
@@ -319,12 +320,18 @@ object KernelXmlTemplate {
 
   private def buildTopStreamPortDefs(descriptor: FullSysGenDescriptor): Seq[TopStreamPortDef] = {
     val ports = mutable.ArrayBuffer[TopStreamPortDef]()
+	val sharedHardCilkInputs = descriptor.expandedAiePlioSharingGroups
+	  .filter(_.sourceKind == AiePlioSourceKind.HardCilkInput)
+	  .flatMap(group =>
+	    group.peIndices.map(peIndex => (group.taskName, peIndex, group.portName))
+	).toSet
 
     descriptor.getSystemConnectionsDescriptor().connections.foreach { connection =>
       val src = connection.srcPort
       val dst = connection.dstPort
 
-      if (src.parentType == "HardCilk" && dst.parentType == "PE") {
+      if (src.parentType == "HardCilk" && dst.parentType == "PE" &&
+	          !sharedHardCilkInputs.contains((dst.parentName, dst.parentIndex, dst.portType))) {
         ports += TopStreamPortDef(
           bindPortName = s"BindTo_PE_${dst.parentName}_${dst.parentIndex}_${dst.portType}",
           mode = "write_only",
@@ -371,15 +378,30 @@ object KernelXmlTemplate {
             )
 
             if (req.`type` == "read") {
-              ports += TopStreamPortDef(
-                bindPortName = rwTopPortName(subPEName, peIndex, "sinkResult"),
-                mode = "read_only",
-                bitWidth = req.portWidth
-              )
+              val responseIsShared = descriptor.expandedAiePlioSharingGroups.exists { group =>
+                group.sourceKind == AiePlioSourceKind.ReadResponse &&
+                group.sourceSubPEName == subPEName &&
+                group.peIndices.contains(peIndex)
+              }
+              if (!responseIsShared) {
+                ports += TopStreamPortDef(
+                  bindPortName = rwTopPortName(subPEName, peIndex, "sinkResult"),
+                  mode = "read_only",
+                  bitWidth = req.portWidth
+                )
+              }
             }
           }
         }
       }
+    }
+
+    descriptor.expandedAiePlioSharingGroups.foreach { group =>
+      ports += TopStreamPortDef(
+        bindPortName = group.effectivePhysicalPortName,
+        mode = "write_only",
+        bitWidth = group.packetPortWidth
+      )
     }
 
     ports

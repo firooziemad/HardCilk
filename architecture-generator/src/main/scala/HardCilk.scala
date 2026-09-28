@@ -92,6 +92,10 @@ class HardCilk(
     case (name, factory) => name -> Module(factory())
   }
 
+  // PeIO owns the AIE helper modules. Prepare its shared task-input endpoints
+  // before HardCilk decides which missing-PE ports must remain top-level IO.
+  prepareAiePlioSharing()
+
 
   val demux = instantiateManagementDemux()
   connectManagement(demux, schedulerMap, allocatorMap, memAllocatorMap, notifierMap, remoteStreamToMemMap)
@@ -149,23 +153,36 @@ class HardCilk(
        * First, handle if directly the port is exported
       */
 
-      val newIO = IO(chiselTypeOf(subsystemPort))
       val ioName = f"BindTo_PE_${pePortDesc.parentName}_${pePortDesc.parentIndex}_${pePortDesc.portType}"
-      newIO.suggestName(ioName)
-      println(s"  ... exporting ${ioName}")
+      val consumedByPacketizer = attachAieSharedTaskInput(
+        pePortDesc.parentName,
+        pePortDesc.parentIndex,
+        pePortDesc.portType,
+        subsystemPort
+      )
 
-      if (port.isSource) {
-        newIO <> subsystemPort
-        exportedPeHdlinfoPorts += hdlinfo.Port(
-          ioName, hdlinfo.PortDirection.input, hdlinfo.PortKind.data, associatedClock = "clock"
-        )
+      if (consumedByPacketizer) {
+        println(s"  ... integrating ${ioName} into an AIE packet mux")
       } else {
-        subsystemPort <> newIO
-        exportedPeHdlinfoPorts += hdlinfo.Port(
-          ioName, hdlinfo.PortDirection.output, hdlinfo.PortKind.data, associatedClock = "clock"
-        )
+        val newIO = IO(chiselTypeOf(subsystemPort))
+        newIO.suggestName(ioName)
+        println(s"  ... exporting ${ioName}")
+
+        if (port.isSource) {
+          newIO <> subsystemPort
+          exportedPeHdlinfoPorts += hdlinfo.Port(
+            ioName, hdlinfo.PortDirection.input, hdlinfo.PortKind.data, associatedClock = "clock"
+          )
+        } else {
+          subsystemPort <> newIO
+          exportedPeHdlinfoPorts += hdlinfo.Port(
+            ioName, hdlinfo.PortDirection.output, hdlinfo.PortKind.data, associatedClock = "clock"
+          )
+        }
       }
     }
+
+    validateAieSharedTaskInputs()
   }
 
   private def instantiateManagementDemux(): axi4.lite.components.Demux = {

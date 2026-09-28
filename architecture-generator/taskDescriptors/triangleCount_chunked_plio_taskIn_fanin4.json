@@ -1,0 +1,256 @@
+{
+  "fpgaModel": "ALVEO_U55C",
+  "mallocList": {},
+  "memorySizeSim": 16,
+  "name": "triangleCount",
+  "spawnList": {
+    "tc_main": [
+      "vertex_map"
+    ]
+  },
+  "spawnNextList": {
+    "tc_main": [
+      "tc_acc"
+    ]
+  },
+  "sendArgumentList": {
+    "vertex_map": [
+      "tc_acc"
+    ],
+    "tc_acc": [
+      "tc_acc"
+    ]
+  },
+  "targetFrequency": 300,
+  "taskDescriptors": [
+    {
+      "name": "tc_main",
+      "taskId": 0,
+      "isRoot": true,
+      "isCont": false,
+      "isAIE": true,
+      "numProcessingElements": 1,
+      "spawnServersCount": 0,
+      "dynamicMemAlloc": false,
+      "variableSpawn": false,
+      "widthMalloc": 0,
+      "widthTask": 512,
+      "hasAXI": false,
+      "generateSpawnNextWriteBuffer": false,
+      "generateArgOutWriteBuffer": false,
+      "argumentSizeList": [
+        32
+      ],
+      "peHDLPath": "",
+      "sidesConfigs": [
+        {
+          "sideType": "scheduler",
+          "numVirtualServers": 1,
+          "capacityVirtualQueue": 1024,
+          "capacityPhysicalQueue": 64,
+          "portWidth": 512
+        }
+      ]
+    },
+    {
+      "name": "vertex_map",
+      "taskId": 1,
+      "isRoot": false,
+      "isCont": false,
+      "isAIE": true,
+      "numProcessingElements": 16,
+      "spawnServersCount": 1,
+      "dynamicMemAlloc": false,
+      "variableSpawn": false,
+      "widthMalloc": 0,
+      "widthTask": 512,
+      "hasAXI": false,
+      "generateSpawnNextWriteBuffer": false,
+      "generateArgOutWriteBuffer": false,
+      "argumentSizeList": [
+        32
+      ],
+      "peHDLPath": "",
+      "sidesConfigs": [
+        {
+          "sideType": "scheduler",
+          "numVirtualServers": 1,
+          "capacityVirtualQueue": 4194304,
+          "capacityPhysicalQueue": 64,
+          "portWidth": 512
+        }
+      ]
+    },
+    {
+      "name": "tc_acc",
+      "taskId": 2,
+      "isRoot": false,
+      "isCont": true,
+      "isAIE": true,
+      "numProcessingElements": 1,
+      "spawnServersCount": 1,
+      "dynamicMemAlloc": false,
+      "variableSpawn": false,
+      "widthMalloc": 0,
+      "widthTask": 512,
+      "hasAXI": false,
+      "generateSpawnNextWriteBuffer": false,
+      "generateArgOutWriteBuffer": false,
+      "argumentSizeList": [
+        32
+      ],
+      "peHDLPath": "",
+      "sidesConfigs": [
+        {
+          "sideType": "scheduler",
+          "numVirtualServers": 1,
+          "capacityVirtualQueue": 1024,
+          "capacityPhysicalQueue": 64,
+          "portWidth": 512
+        },
+        {
+          "sideType": "argumentNotifier",
+          "numVirtualServers": 1,
+          "capacityVirtualQueue": 1024,
+          "capacityPhysicalQueue": 32,
+          "portWidth": 64
+        },
+        {
+          "sideType": "allocator",
+          "numVirtualServers": 1,
+          "capacityVirtualQueue": 1024,
+          "capacityPhysicalQueue": 32,
+          "portWidth": 64
+        }
+      ]
+    }
+  ],
+  "widthAddress": 64,
+  "widthContCounter": 32,
+  "isVitisProject": true,
+  "keepAXI4Interfaces": true,
+  "mFPGASynth": false,
+  "mFPGASimulation": false,
+  "maximumAXIPorts": 27,
+  "hasAXIDMAInput": false,
+  "transformAXI": false,
+  "transformPattern": [],
+  "widthAXIAddress": 64,
+  "subPEList": {
+    "tc_main": {
+      "peName": "tc_main",
+      "rwRequest": {
+        "type": "write",
+        "mode": "single",
+        "portWidth": 128
+      }
+    },
+    "tc_readvertex": {
+      "peName": "vertex_map",
+      "rwRequest": {
+        "type": "read",
+        "mode": "single",
+        "portWidth": 64,
+        "nextsubPE": "tc_readneighborids"
+      }
+    },
+    "tc_readneighborids": {
+      "peName": "vertex_map",
+      "rwRequest": {
+        "type": "read",
+        "mode": "stream",
+        "portWidth": 32,
+        "nextsubPE": "tc_req_v_lists"
+      }
+    },
+    "tc_req_v_lists": {
+      "peName": "vertex_map",
+      "rwRequest": {
+        "type": "read",
+        "mode": "single",
+        "portWidth": 64,
+        "nextsubPE": "tc_req_v_stream"
+      }
+    },
+    "tc_req_v_stream": {
+      "peName": "vertex_map",
+      "rwRequest": {
+        "type": "read",
+        "mode": "stream",
+        "portWidth": 32,
+        "nextsubPE": "tc_intersect"
+      }
+    },
+    "tc_intersect": {
+      "peName": "vertex_map",
+      "rwRequest": {
+        "type": "write",
+        "mode": "single",
+        "portWidth": 128
+      }
+    },
+    "tc_acc_req": {
+      "peName": "tc_acc",
+      "rwRequest": {
+        "type": "read",
+        "mode": "stream",
+        "portWidth": 32,
+        "nextsubPE": "tc_acc_sum"
+      }
+    },
+    "tc_acc_sum": {
+      "peName": "tc_acc",
+      "rwRequest": {
+        "type": "write",
+        "mode": "single",
+        "portWidth": 128
+      }
+    }
+  },
+  "aiePlioSharingGroups": [
+    {
+      "direction": "plToAie",
+      "mode": "single",
+      "members": [
+        {
+          "subPEName": "tc_readvertex",
+          "portName": "taskIn",
+          "share": 4
+        }
+      ]
+    },
+    {
+      "direction": "plToAie",
+      "mode": "single",
+      "members": [
+        {
+          "subPEName": "tc_readvertex",
+          "portName": "taskIn",
+          "share": 4
+        }
+      ]
+    },
+    {
+      "direction": "plToAie",
+      "mode": "single",
+      "members": [
+        {
+          "subPEName": "tc_readvertex",
+          "portName": "taskIn",
+          "share": 4
+        }
+      ]
+    },
+    {
+      "direction": "plToAie",
+      "mode": "single",
+      "members": [
+        {
+          "subPEName": "tc_readvertex",
+          "portName": "taskIn",
+          "share": 4
+        }
+      ]
+    }
+  ]
+}

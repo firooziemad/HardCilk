@@ -54,7 +54,24 @@ object ProjectHeaderTemplate {
   def generateProjectHeader(descriptor: FullSysGenDescriptor, projectFolder: String): Unit = {
     val units = buildUnits(descriptor)
     val portBitWidthsByTaskPePort = buildHardCilkPortBitWidthsByTaskPePort(descriptor)
-    val ports = buildPortDefs(descriptor, units, portBitWidthsByTaskPePort)
+    val logicalPorts = buildPortDefs(descriptor, units, portBitWidthsByTaskPePort)
+    val sharingGroups = descriptor.expandedAiePlioSharingGroups
+    val sharedMembers = sharingGroups.flatMap(_.members).toSet
+    val inputPortNames = logicalPorts.filter(_.direction == "input").map(_.varName).toSet
+    val missingMembers = sharedMembers -- inputPortNames
+    require(missingMembers.isEmpty,
+      s"AIE PLIO sharing members are not generated input PLIOs: ${missingMembers.toSeq.sorted.mkString(", ")}")
+
+    val physicalPorts = sharingGroups.map { group =>
+      PortDef(
+        varName = group.effectivePhysicalPortName,
+        plioName = s"PLIO_${group.effectivePhysicalPortName}",
+        direction = "input",
+        bits = group.physicalPlioWidth
+      )
+    }
+    val ports = (logicalPorts.filterNot(port => sharedMembers.contains(port.varName)) ++ physicalPorts)
+      .sortBy(_.varName)
 
     val lines =
       Seq(
@@ -69,9 +86,11 @@ object ProjectHeaderTemplate {
         buildKernelDeclarations(units) ++
         Seq("public:") ++
         buildPortDeclarations(ports) ++
+		buildPacketSplitterDeclarations(sharingGroups) ++
         Seq("  simpleGraph(){") ++
         Seq("    // PLIOs") ++
         buildPlioCreations(ports) ++
+		buildPacketSplitterCreates(sharingGroups) ++
         Seq("", "    // Kernels") ++
         buildKernelCreates(units) ++
         Seq("", "    // Connections") ++
@@ -389,7 +408,10 @@ object ProjectHeaderTemplate {
       val outputPorts = taskOutputPorts ++ rwOutputPorts
       val groupedOutputPorts =
         if (unit.nextChainUnitName.nonEmpty) outputPorts.filterNot(_ == "taskOutInternal")
-        else Seq.empty[String]
+        else buildStreamSplitterGroups(descriptor)
+          .find(group => group.taskName == unit.taskName && group.peIndex == unit.peIndex)
+          .map(_.outputPortTypes.filter(outputPorts.contains))
+          .getOrElse(Seq.empty[String])
       val groupedOutputSet = groupedOutputPorts.toSet
 
       inputPorts.foreach { p =>
@@ -475,11 +497,17 @@ object ProjectHeaderTemplate {
       s"  $kind ${p.varName};"
     }
 
+  private def buildPacketSplitterDeclarations(groups: Seq[AIEPlioPhysicalSharingGroupDescriptor]): Seq[String] =
+    groups.map(group => s"  pktsplit<${group.fanIn}> ${group.name}_split;")
+
   private def buildPlioCreations(ports: Seq[PortDef]): Seq[String] =
     ports.map { p =>
       val creator = if (p.direction == "input") "input_plio::create" else "output_plio::create"
       s"    ${p.varName} = $creator(\"${p.plioName}\", adf::plio_${p.bits}_bits, \"data/${p.varName}.txt\");"
     }
+
+  private def buildPacketSplitterCreates(groups: Seq[AIEPlioPhysicalSharingGroupDescriptor]): Seq[String] =
+    groups.map(group => s"    ${group.name}_split = pktsplit<${group.fanIn}>::create();")
 
   private def buildKernelCreates(units: Seq[UnitDef]): Seq[String] =
     units.flatMap { u =>
@@ -494,6 +522,15 @@ object ProjectHeaderTemplate {
     val lines = mutable.ArrayBuffer[String]()
     var net = 0
     val unitsByName = units.map(u => u.unitName -> u).toMap
+	val sharedMemberRoutes = descriptor.expandedAiePlioSharingGroups.flatMap { group =>
+	  group.members.zipWithIndex.map { case (member, branchIndex) =>
+		member -> (group, branchIndex)
+	  }
+	}.toMap
+
+	descriptor.expandedAiePlioSharingGroups.zipWithIndex.foreach { case (group, groupIndex) =>
+	  lines += s"    connect< pktstream > sharedPhysicalNet$groupIndex (${group.effectivePhysicalPortName}.out[0], ${group.name}_split.in[0]);"
+	}
 
     units.foreach { u =>
       val inputPorts = orderTaskInputPorts(u.taskInputPorts) ++ u.rwInputPorts.sorted
@@ -502,7 +539,10 @@ object ProjectHeaderTemplate {
       val outputPorts = taskOutputPorts ++ rwOutputPorts
       val groupedOutputPorts =
         if (u.nextChainUnitName.nonEmpty) outputPorts.filterNot(_ == "taskOutInternal")
-        else Seq.empty[String]
+        else buildStreamSplitterGroups(descriptor)
+          .find(group => group.taskName == u.taskName && group.peIndex == u.peIndex)
+          .map(_.outputPortTypes.filter(outputPorts.contains))
+          .getOrElse(Seq.empty[String])
       val groupedOutputSet = groupedOutputPorts.toSet
       val groupedOutputRepr = groupedOutputPorts.headOption
 
@@ -545,7 +585,12 @@ object ProjectHeaderTemplate {
           }
         } else {
           val plioVar = s"${u.unitName}_$port"
-          lines += s"    connect< stream > net$net (${plioVar}.out[0], ${u.unitName}_kernel.in[$inIdx]);"
+		  sharedMemberRoutes.get(plioVar) match {
+			case Some((group, branchIndex)) =>
+			  lines += s"    connect< pktstream, stream > net$net (${group.name}_split.out[$branchIndex], ${u.unitName}_kernel.in[$inIdx]);"
+			case None =>
+			  lines += s"    connect< stream > net$net (${plioVar}.out[0], ${u.unitName}_kernel.in[$inIdx]);"
+		  }
           net += 1
         }
       }

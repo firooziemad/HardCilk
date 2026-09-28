@@ -24,6 +24,7 @@ import Util.WriteBuffer
 import Util.AxiPageBoundarySplitter_Basic
 import Util.AxiPageBoundarySplitter_Config
 import Util.RemoteStreamToMem
+import scala.collection.mutable
 
 /**
  * A trait that encapsulates the HBM AXI interconnect generation logic.
@@ -46,6 +47,86 @@ trait HasHBMInterconnect extends Module {
 
   // This is an "output" var that this trait will update
   var numHbmPortExports: Int
+
+  private val peIOByTaskName = mutable.Map[String, PeIO]()
+  private val sharedHardCilkInputSinks =
+    mutable.Map[(String, Int, String), (Int, axi4s.Interface)]()
+  private val attachedSharedHardCilkInputs = mutable.Set[(String, Int, String)]()
+
+  private def getOrCreatePeIO(task: TaskDescriptor): PeIO = {
+    peIOByTaskName.getOrElseUpdate(task.name, {
+      val subPEs = fullSysGenDescriptor.subPEList.filter(_._2.peName == task.name)
+      val sharingGroups = fullSysGenDescriptor.expandedAiePlioSharingGroups
+        .filter(_.taskName == task.name)
+      Module(new PeIO(
+        subPEs,
+        task.numProcessingElements,
+        task.name,
+        sharingGroups
+      ))
+    })
+  }
+
+  /**
+   * Instantiates the PeIO containers that own configured AIE packetizers and
+   * exports their physical packet streams from the single HardCilk top.
+   * This is called before missing PE ports are attached.
+   */
+  def prepareAiePlioSharing(): Unit = {
+    fullSysGenDescriptor.expandedAiePlioSharingGroups
+      .map(_.taskName)
+      .distinct
+      .foreach { taskName =>
+        val task = fullSysGenDescriptor.taskDescriptors
+          .find(_.name == taskName)
+          .getOrElse(throw new IllegalArgumentException(
+            s"AIE PLIO sharing references unknown task '$taskName'"
+          ))
+        val peIO = getOrCreatePeIO(task)
+
+        peIO.sharedHardCilkInputs.foreach { sharedInput =>
+          val key = (sharedInput.taskName, sharedInput.index, sharedInput.portName)
+          require(!sharedHardCilkInputSinks.contains(key),
+            s"HardCilk input ${sharedInput.taskName}[${sharedInput.index}].${sharedInput.portName} belongs to more than one packetizer")
+          sharedHardCilkInputSinks(key) = (sharedInput.logicalWidth, sharedInput.sink)
+        }
+
+        peIO.sharedPacketOutputs.foreach { sharedOutput =>
+          val physical = IO(chiselTypeOf(sharedOutput.source))
+            .suggestName(sharedOutput.physicalPortName)
+          sharedOutput.source.asFull :=> physical.asFull
+        }
+      }
+  }
+
+  /** Returns true when PeIO consumes this HardCilk-to-PE input. */
+  def attachAieSharedTaskInput(
+      taskName: String,
+      peIndex: Int,
+      portType: String,
+      hardCilkPort: Data
+  ): Boolean = {
+    val key = (taskName, peIndex, portType)
+    if (!sharedHardCilkInputSinks.contains(key)) {
+      false
+    } else {
+      require(!attachedSharedHardCilkInputs.contains(key),
+        s"HardCilk input $taskName[$peIndex].$portType was attached more than once")
+      val stream = hardCilkPort.asInstanceOf[axi4s.Interface]
+      val (expectedWidth, sink) = sharedHardCilkInputSinks(key)
+      require(stream.cfg.wData == expectedWidth && stream.cfg.onlyRV,
+        s"HardCilk input $taskName[$peIndex].$portType must be a $expectedWidth-bit ready/valid AXI stream")
+      stream.asLite :=> sink.asLite
+      attachedSharedHardCilkInputs += key
+      true
+    }
+  }
+
+  def validateAieSharedTaskInputs(): Unit = {
+    val missing = sharedHardCilkInputSinks.keySet.toSet -- attachedSharedHardCilkInputs
+    require(missing.isEmpty,
+      s"Configured AIE packet-mux HardCilk inputs were not found: ${missing.toSeq.sorted.mkString(", ")}")
+  }
 
   /**
    * This method is now part of the trait. It contains the exact logic
@@ -83,7 +164,7 @@ trait HasHBMInterconnect extends Module {
     for (task <- aiePEs) {
       val subPEs = fullSysGenDescriptor.subPEList.filter(_._2.peName == task.name)
       if (subPEs.nonEmpty) {
-        val peIO = Module(new PeIO(subPEs, task.numProcessingElements))
+        val peIO = getOrCreatePeIO(task)
         peIO.axiMasters.foreach { port =>
           interfacesPE.addOne(port)
         }
@@ -93,7 +174,9 @@ trait HasHBMInterconnect extends Module {
             IO(chiselTypeOf(rwPort.sourceTask)).suggestName(s"${rwPort.instanceName}_sourceTask")
           sourceTask.asLite :=> rwPort.sourceTask.asLite
 
-          rwPort.sinkResult.foreach { sink =>
+          rwPort.sinkResult
+            .filterNot(_ => peIO.sharedReadResponseKeys.contains((rwPort.subPEName, rwPort.index)))
+            .foreach { sink =>
             val sinkResult =
               IO(chiselTypeOf(sink)).suggestName(s"${rwPort.instanceName}_sinkResult")
             sink.asFull :=> sinkResult.asFull

@@ -15,6 +15,7 @@ case class BuilderConfig(
   project_aie_generation: Boolean = false,
   output_dir: String = ".",
   json_path: String = "",
+  aie_packet_report: String = "",
   // additional small flags that the HardCilk constructor sometimes uses
   argumentNotifierCutCount: Int = 1,
   addressTransformFlag: Boolean = false
@@ -34,6 +35,9 @@ object ArgParser {
       opt[String]('o', "output-dir")
         .action((x, c) => c.copy(output_dir = x))
         .text("output directory"),
+      opt[String]("aie-packet-report")
+        .action((x, c) => c.copy(aie_packet_report = x))
+        .text("AIE compiler packet_switching_report.json used to resolve packet IDs for RTL generation"),
       opt[Unit]('d', "debug")
         .action((_, c) => c.copy(debug = true))
         .text("enable debug hardware counters and simulation logging"),
@@ -111,5 +115,4 @@ object ArgParserExample extends App {
       // parser already printed usage
   }
 }
-
 

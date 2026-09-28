@@ -1,0 +1,106 @@
+package SoftwareUtil.aie
+
+import Descriptors._
+import io.circe.Json
+import io.circe.parser.parse
+import io.circe.syntax._
+
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Path}
+
+object AIEPacketIdResolver {
+  private val BranchIndex = raw".*\.out\[(\d+)\]$$".r
+
+  case class ResolvedGroup(name: String, packetIds: Vector[Int])
+
+  def resolve(
+      descriptor: FullSysGenDescriptor,
+      reportPath: Path
+  ): Seq[ResolvedGroup] = {
+    require(Files.isRegularFile(reportPath),
+      s"AIE packet switching report not found: $reportPath")
+
+    val reportText = Files.readString(reportPath, StandardCharsets.UTF_8)
+    val report = parse(reportText).fold(
+      error => throw new IllegalArgumentException(
+        s"Cannot parse AIE packet switching report '$reportPath': ${error.message}"
+      ),
+      identity
+    )
+    val internal = report.hcursor.downField("Internal").focus
+      .flatMap(_.asArray)
+      .getOrElse(throw new IllegalArgumentException(
+        s"AIE packet switching report '$reportPath' has no Internal array"
+      ))
+
+    descriptor.expandedAiePlioSharingGroups.map { group =>
+      val expectedSplit = s"${group.name}_split"
+      val branches = internal.flatMap(entry => parseBranch(entry, expectedSplit))
+      val duplicateIndices = branches.groupBy(_._1).collect {
+        case (index, entries) if entries.lengthCompare(1) > 0 => index
+      }
+      require(duplicateIndices.isEmpty,
+        s"AIE packet switching report has duplicate outputs for '$expectedSplit': ${duplicateIndices.toSeq.sorted.mkString(", ")}")
+
+      val byIndex = branches.toMap
+      val expectedIndices = group.peIndices.indices
+      val missing = expectedIndices.filterNot(byIndex.contains)
+      require(missing.isEmpty,
+        s"AIE packet switching report has no packet ID for ${missing.map(i => s"$expectedSplit.out[$i]").mkString(", ")}")
+
+      val unexpected = byIndex.keySet.filterNot(expectedIndices.contains)
+      require(unexpected.isEmpty,
+        s"AIE packet switching report contains unexpected outputs for '$expectedSplit': ${unexpected.toSeq.sorted.mkString(", ")}")
+
+      val ids = expectedIndices.map(byIndex).toVector
+      group.resolvePacketIds(ids)
+      ResolvedGroup(group.name, ids)
+    }
+  }
+
+  def writeManifest(
+      resolvedGroups: Seq[ResolvedGroup],
+      reportPath: Path,
+      outputPath: Path
+  ): Unit = {
+    val groupsJson = resolvedGroups.map { group =>
+      Json.obj(
+        "name" -> group.name.asJson,
+        "packetIds" -> group.packetIds.asJson
+      )
+    }
+    val manifest = Json.obj(
+      "sourceReport" -> reportPath.toAbsolutePath.normalize.toString.asJson,
+      "groups" -> groupsJson.asJson
+    )
+    Files.writeString(
+      outputPath,
+      manifest.spaces2 + System.lineSeparator(),
+      StandardCharsets.UTF_8
+    )
+  }
+
+  private def parseBranch(entry: Json, expectedSplit: String): Option[(Int, Int)] = {
+    val output = entry.hcursor.downField("Output")
+    val split = output.get[String]("Split").toOption
+    val portName = output.get[String]("PortName").toOption
+    val packetIds = entry.hcursor.get[Vector[Int]]("PacketID").toOption
+
+    if (!split.exists(name => name == expectedSplit || name.endsWith(s".$expectedSplit"))) {
+      None
+    } else {
+      val index = portName.flatMap {
+        case BranchIndex(value) => Some(value.toInt)
+        case _ => None
+      }.getOrElse(throw new IllegalArgumentException(
+        s"AIE compiler output for '$expectedSplit' has no recognizable split output PortName"
+      ))
+      val ids = packetIds.getOrElse(throw new IllegalArgumentException(
+        s"AIE compiler output '$expectedSplit.out[$index]' has no PacketID array"
+      ))
+      require(ids.length == 1,
+        s"AIE compiler output '$expectedSplit.out[$index]' must have exactly one packet ID, found ${ids.mkString(",")}")
+      Some(index -> ids.head)
+    }
+  }
+}

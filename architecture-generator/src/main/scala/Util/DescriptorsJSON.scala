@@ -41,6 +41,42 @@ object DescriptorJSON {
   implicit val subPEDescriptorDecoder: Decoder[SubPEDescriptor] = deriveConfiguredDecoder[SubPEDescriptor]
   implicit val subPEDescriptorEncoder: Encoder[SubPEDescriptor] = deriveConfiguredEncoder[SubPEDescriptor]
 
+  private def rejectUnknownFields[A](
+      typeName: String,
+      allowedFields: Set[String],
+      decoder: Decoder[A]
+  ): Decoder[A] = Decoder.instance { cursor =>
+    val unknownFields = cursor.keys.getOrElse(Iterable.empty).toSet -- allowedFields
+    if (unknownFields.nonEmpty) {
+      Left(DecodingFailure(
+        s"$typeName contains unsupported fields: ${unknownFields.toSeq.sorted.mkString(", ")}",
+        cursor.history
+      ))
+    } else {
+      decoder(cursor)
+    }
+  }
+
+  private val aiePlioSharingMemberDescriptorBaseDecoder =
+    deriveConfiguredDecoder[AIEPlioSharingMemberDescriptor]
+  implicit val aiePlioSharingMemberDescriptorDecoder: Decoder[AIEPlioSharingMemberDescriptor] =
+    rejectUnknownFields(
+      "AIE PLIO sharing member",
+      Set("subPEName", "portName", "share"),
+      aiePlioSharingMemberDescriptorBaseDecoder
+    )
+  implicit val aiePlioSharingMemberDescriptorEncoder: Encoder[AIEPlioSharingMemberDescriptor] = deriveConfiguredEncoder[AIEPlioSharingMemberDescriptor]
+
+  private val aiePlioSharingGroupDescriptorBaseDecoder =
+    deriveConfiguredDecoder[AIEPlioSharingGroupDescriptor]
+  implicit val aiePlioSharingGroupDescriptorDecoder: Decoder[AIEPlioSharingGroupDescriptor] =
+    rejectUnknownFields(
+      "AIE PLIO sharing group",
+      Set("direction", "mode", "members", "physicalPlioWidth", "fifoDepth"),
+      aiePlioSharingGroupDescriptorBaseDecoder
+    )
+  implicit val aiePlioSharingGroupDescriptorEncoder: Encoder[AIEPlioSharingGroupDescriptor] = deriveConfiguredEncoder[AIEPlioSharingGroupDescriptor]
+
   implicit val sideConfigDecoder: Decoder[SideConfig] = deriveConfiguredDecoder[SideConfig]
   implicit val sideConfigEncoder: Encoder[SideConfig] = deriveConfiguredEncoder[SideConfig]
 

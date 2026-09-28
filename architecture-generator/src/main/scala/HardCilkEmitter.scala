@@ -27,6 +27,20 @@ object HardCilkEmitter extends App {
 
       val systemDescriptor = parseJsonFile[FullSysGenDescriptor](cfg.json_path)
 
+      // The original HardCilk flow validates before RTL elaboration.  Sharing
+      // descriptors also affect the AIE graph, so apply that same validation
+      // before emitting a packet-switched AIE project.  Descriptors without
+      // sharing groups retain the original AIECilk behavior.
+      if (cfg.project_aie_generation && systemDescriptor.aiePlioSharingGroups.nonEmpty) {
+        try {
+          systemDescriptor.validate()
+        } catch {
+          case e: IllegalArgumentException =>
+            System.err.println(s"AIE project generation failed: ${e.getMessage}")
+            System.exit(1)
+        }
+      }
+
 
       if (!cfg.rtl_generation) {
         println("RTL generation not requested.")
@@ -34,24 +48,53 @@ object HardCilkEmitter extends App {
         val outputDirPathRTL = s"${cfg.output_dir}/$outputDirName/rtl"
         Files.createDirectories(Paths.get(outputDirPathRTL))
 
-        // Read system descriptor from JSON
         try {
           systemDescriptor.validate() // <-- EXPLICITLY VALIDATE HERE
+
+          if (systemDescriptor.aiePlioSharingGroups.nonEmpty) {
+            val automaticReport = Paths.get(
+              cfg.output_dir,
+              outputDirName,
+              "software",
+              s"aie_${jsonName}",
+              "Work",
+              "reports",
+              "packet_switching_report.json"
+            )
+            val reportPath =
+              if (cfg.aie_packet_report.nonEmpty) Paths.get(cfg.aie_packet_report)
+              else automaticReport
+
+            require(Files.isRegularFile(reportPath),
+              s"AIE packet switching report not found: $reportPath. " +
+              "Generate the AIE project with -k, compile it with aiecompiler/v++, " +
+              "then rerun RTL generation with -g. Use --aie-packet-report when the report is outside the generated AIE project.")
+
+            val resolvedGroups = AIEPacketIdResolver.resolve(systemDescriptor, reportPath)
+            resolvedGroups.foreach { group =>
+              println(s"Resolved AIE packet IDs for ${group.name}: ${group.packetIds.mkString(", ")}")
+            }
+            AIEPacketIdResolver.writeManifest(
+              resolvedGroups,
+              reportPath,
+              Paths.get(outputDirPathRTL, "aie_packet_ids.json")
+            )
+          }
+
+          // Call the generate RTL function
+          val numHbmPortExports = generateRTL(
+            systemDescriptor = systemDescriptor,
+            pathInputJsonFile = cfg.json_path,
+            outputDirPathRTL = outputDirPathRTL,
+            flags = cfg,
+            isSimulation = false
+          )
+          println(s"Emitted RTL to: $outputDirPathRTL")
         } catch {
           case e: IllegalArgumentException =>
-            System.err.println(s"JSON Validation Failed: ${e.getMessage}")
+            System.err.println(s"RTL generation failed: ${e.getMessage}")
             System.exit(1)
         }
-
-        // Call the generate RTL function
-        val numHbmPortExports = generateRTL(
-          systemDescriptor = systemDescriptor,
-          pathInputJsonFile = cfg.json_path,
-          outputDirPathRTL = outputDirPathRTL,
-          flags = cfg,
-          isSimulation = false
-        )
-        println(s"Emitted RTL to: $outputDirPathRTL")
       }
 
       if (cfg.project_sc_generation) {

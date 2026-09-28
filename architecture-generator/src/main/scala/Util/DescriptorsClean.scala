@@ -228,6 +228,163 @@ case class TaskDescriptor(
   }
 }
 
+case class AIEPlioSharingMemberDescriptor(
+    subPEName: String,
+    portName: String,
+    share: Int
+) {
+  def validate(groupLabel: String): Unit = {
+    require(subPEName.matches("[A-Za-z_][A-Za-z0-9_]*"),
+      s"AIE PLIO sharing group '$groupLabel': invalid subPEName '$subPEName'")
+    require(portName.matches("[A-Za-z_][A-Za-z0-9_]*"),
+      s"AIE PLIO sharing group '$groupLabel': invalid portName '$portName'")
+    require(share >= 2 && share <= 32,
+      s"AIE PLIO sharing group '$groupLabel': share must be between 2 and 32")
+  }
+}
+
+/**
+  * Compact user-facing description of one physical PLIO.
+  *
+  * A group currently contains one homogeneous logical endpoint and packetizes
+  * `share` consecutive, previously-unassigned PE instances of that endpoint.
+  * `single` mode synthesizes TLAST per transfer; `stream` mode preserves the
+  * input TLAST and locks arbitration through the complete packet.
+  */
+case class AIEPlioSharingGroupDescriptor(
+    direction: String,
+    mode: String,
+    members: List[AIEPlioSharingMemberDescriptor],
+    physicalPlioWidth: Int = 128,
+    fifoDepth: Int = 2
+) {
+  def label(index: Int): String = s"group_$index"
+
+  def validate(index: Int): Unit = {
+    val groupLabel = label(index)
+    require(direction == "plToAie",
+      s"AIE PLIO sharing group '$groupLabel': PL-to-AIE packet muxes support only plToAie")
+    require(Set(AiePlioSharingMode.Single, AiePlioSharingMode.Stream).contains(mode),
+      s"AIE PLIO sharing group '$groupLabel': mode must be 'single' or 'stream'")
+    require(members.nonEmpty,
+      s"AIE PLIO sharing group '$groupLabel': members must not be empty")
+    require(members.length == 1,
+      s"AIE PLIO sharing group '$groupLabel': packet muxes currently support exactly one homogeneous member")
+    members.foreach(_.validate(groupLabel))
+    require(Set(32, 64, 128).contains(physicalPlioWidth),
+      s"AIE PLIO sharing group '$groupLabel': physicalPlioWidth must be 32, 64, or 128")
+    require(fifoDepth > 0,
+      s"AIE PLIO sharing group '$groupLabel': fifoDepth must be positive")
+  }
+}
+
+object AiePlioSharingMode {
+  val Single = "single"
+  val Stream = "stream"
+}
+
+object AiePlioSourceKind {
+  val HardCilkInput = "hardCilkInput"
+  val ReadResponse = "readResponse"
+}
+
+/** Fully expanded physical group consumed by RTL and AIE generators. */
+case class AIEPlioPhysicalSharingGroupDescriptor(
+    name: String,
+    direction: String,
+    mode: String,
+    taskName: String,
+    subPEName: String,
+    portName: String,
+    peIndices: List[Int],
+    members: List[String],
+    physicalPortName: String,
+    physicalPlioWidth: Int,
+    fifoDepth: Int,
+    logicalWidth: Int,
+    sourceKind: String,
+    sourceSubPEName: String
+) {
+  @transient private var resolvedPacketIds: Vector[Int] = Vector.empty
+
+  def fanIn: Int = peIndices.length
+
+  def effectivePhysicalPortName: String =
+    if (physicalPortName.nonEmpty) physicalPortName else name
+
+  def packetPortWidth: Int =
+    mode match {
+      case AiePlioSharingMode.Single => logicalWidth + 32
+      case AiePlioSharingMode.Stream => physicalPlioWidth
+      case other => throw new IllegalArgumentException(
+        s"AIE PLIO sharing group '$name': unsupported mode '$other'"
+      )
+    }
+
+  def resolvePacketIds(ids: Seq[Int]): Unit = {
+    val resolved = ids.toVector
+    require(resolved.length == peIndices.length,
+      s"AIE PLIO sharing group '$name': compiler report returned ${resolved.length} packet IDs for ${peIndices.length} branches")
+    require(resolved.distinct.length == resolved.length,
+      s"AIE PLIO sharing group '$name': compiler-assigned packet IDs must be unique")
+    require(resolved.forall(id => id >= 0 && id < 32),
+      s"AIE PLIO sharing group '$name': compiler-assigned packet IDs must be in [0, 31]")
+    resolvedPacketIds = resolved
+  }
+
+  def packetIds: Vector[Int] = {
+    require(resolvedPacketIds.nonEmpty,
+      s"AIE PLIO sharing group '$name': packet IDs have not been resolved from the AIE compiler report")
+    resolvedPacketIds
+  }
+
+  def validate(descriptor: FullSysGenDescriptor): Unit = {
+    require(name.matches("[A-Za-z_][A-Za-z0-9_]*"),
+      s"AIE PLIO sharing group '$name': invalid group name")
+    require(effectivePhysicalPortName.matches("[A-Za-z_][A-Za-z0-9_]*"),
+      s"AIE PLIO sharing group '$name': invalid physicalPortName")
+    require(direction == "plToAie",
+      s"AIE PLIO sharing group '$name': PL-to-AIE packet muxes support only plToAie")
+    require(fanIn >= 2 && fanIn <= 32,
+      s"AIE PLIO sharing group '$name': fan-in must be between 2 and 32")
+    require(members.length == fanIn,
+      s"AIE PLIO sharing group '$name': peIndices and members must have the same length")
+    require(peIndices.distinct.length == peIndices.length,
+      s"AIE PLIO sharing group '$name': peIndices must be unique")
+    require(members.distinct.length == members.length,
+      s"AIE PLIO sharing group '$name': members must be unique")
+    require(Set(32, 64, 128).contains(physicalPlioWidth),
+      s"AIE PLIO sharing group '$name': physicalPlioWidth must be 32, 64, or 128")
+    require(fifoDepth > 0,
+      s"AIE PLIO sharing group '$name': fifoDepth must be positive")
+    require(Set(AiePlioSharingMode.Single, AiePlioSharingMode.Stream).contains(mode),
+      s"AIE PLIO sharing group '$name': mode must be 'single' or 'stream'")
+    require(logicalWidth > 0 && logicalWidth % 8 == 0,
+      s"AIE PLIO sharing group '$name': logical width must be a positive multiple of eight")
+    if (mode == AiePlioSharingMode.Stream) {
+      require(logicalWidth >= 8 && isPow2(logicalWidth),
+        s"AIE PLIO sharing group '$name': stream mode requires a byte-aligned power-of-two logical width")
+    }
+    require(Set(AiePlioSourceKind.HardCilkInput, AiePlioSourceKind.ReadResponse).contains(sourceKind),
+      s"AIE PLIO sharing group '$name': unsupported logical source kind '$sourceKind'")
+    require(subPEName.nonEmpty && portName.nonEmpty,
+      s"AIE PLIO sharing group '$name': resolved endpoint names must not be empty")
+    if (sourceKind == AiePlioSourceKind.ReadResponse) {
+      require(sourceSubPEName.nonEmpty,
+        s"AIE PLIO sharing group '$name': a read response must identify its PL-side read helper")
+    }
+
+    val task = descriptor.taskDescriptors.find(_.name == taskName).getOrElse(
+      throw new IllegalArgumentException(
+        s"AIE PLIO sharing group '$name': unknown task '$taskName'"
+      )
+    )
+    require(peIndices.forall(index => index >= 0 && index < task.numProcessingElements),
+      s"AIE PLIO sharing group '$name': a PE index is outside task '$taskName' range [0, ${task.numProcessingElements - 1}]")
+
+  }
+}
+
 // --- FullSysGenDescriptor with validation ---
 case class FullSysGenDescriptor(
     name: String,
@@ -252,8 +409,124 @@ case class FullSysGenDescriptor(
     transformAXI: Boolean = false,
     transformPattern: List[Int] = List(),
     widthAXIAddress: Int = 34,
-    fpgaCountSim: Int = 1
+    fpgaCountSim: Int = 1,
+    aiePlioSharingGroups: List[AIEPlioSharingGroupDescriptor] = List.empty
 ) {
+  /**
+    * Expand the compact JSON groups once so packet-ID resolution and every
+    * downstream generator operate on the same mutable physical descriptors.
+    */
+  lazy val expandedAiePlioSharingGroups: List[AIEPlioPhysicalSharingGroupDescriptor] = {
+    val nextPeIndex = mutable.Map.empty[(String, String), Int].withDefaultValue(0)
+
+    aiePlioSharingGroups.zipWithIndex.map { case (group, groupIndex) =>
+      group.validate(groupIndex)
+      val member = group.members.head
+      val groupLabel = group.label(groupIndex)
+      val sharingMode = group.mode
+      val subPE = subPEList.getOrElse(member.subPEName,
+        throw new IllegalArgumentException(
+          s"AIE PLIO sharing group '$groupLabel': unknown subPE '${member.subPEName}'"))
+
+      val task = taskDescriptors.find(_.name == subPE.peName).getOrElse(
+        throw new IllegalArgumentException(
+          s"AIE PLIO sharing group '$groupLabel': subPE '${member.subPEName}' references unknown task '${subPE.peName}'"))
+
+      val isHardCilkInput =
+        member.portName == "taskIn" || subPE.taskInputPorts.contains(member.portName)
+
+      val incomingReadResponses = subPEList.toSeq.flatMap {
+        case (sourceSubPEName, sourceSubPE) if sourceSubPE.peName == task.name =>
+          sourceSubPE.rwRequest.toSeq.collect {
+            case req if req.`type` == "read" && req.nextsubPE.contains(member.subPEName) =>
+              val mode = if (req.mode == "single") "Single" else "Stream"
+              (sourceSubPEName, req, s"read${mode}${req.portWidth}In")
+          }
+        case _ => Seq.empty
+      }.filter(_._3 == member.portName)
+
+      require(isHardCilkInput || incomingReadResponses.nonEmpty,
+        s"AIE PLIO sharing group '$groupLabel': '${member.subPEName}.${member.portName}' is neither an exposed HardCilk input nor a read-response input")
+      require(!(isHardCilkInput && incomingReadResponses.nonEmpty),
+        s"AIE PLIO sharing group '$groupLabel': '${member.subPEName}.${member.portName}' resolves ambiguously")
+      require(incomingReadResponses.lengthCompare(1) <= 0,
+        s"AIE PLIO sharing group '$groupLabel': '${member.subPEName}.${member.portName}' has more than one PL-side read-response producer")
+
+      val (logicalWidth, sourceKind, sourceSubPEName) =
+        if (isHardCilkInput) {
+          if (member.portName == "taskIn") {
+            val hasInternalPredecessor = subPEList.values.exists { candidate =>
+              candidate.peName == task.name &&
+                candidate.rwRequest.flatMap(_.nextsubPE).contains(member.subPEName)
+            }
+            require(!hasInternalPredecessor,
+              s"AIE PLIO sharing group '$groupLabel': '${member.subPEName}.taskIn' is internal to the AIE sub-PE chain and has no PLIO")
+          }
+
+          val width =
+            if (member.portName == "taskIn") task.widthTask
+            else getSystemConnectionsDescriptor().connections.collectFirst {
+              case connection
+                  if connection.dstPort.parentType == "PE" &&
+                    connection.dstPort.parentName == task.name &&
+                    connection.dstPort.portType == member.portName =>
+                connection.bitWidth
+            }.getOrElse(throw new IllegalArgumentException(
+              s"AIE PLIO sharing group '$groupLabel': cannot derive the width of HardCilk input '${member.portName}'"
+            ))
+
+          require(sharingMode == AiePlioSharingMode.Single,
+            s"AIE PLIO sharing group '$groupLabel': HardCilk input '${member.portName}' requires mode 'single'")
+          (width, AiePlioSourceKind.HardCilkInput, "")
+        } else {
+          val (producerName, request, _) = incomingReadResponses.head
+          val requiredMode =
+            if (request.mode == "stream") AiePlioSharingMode.Stream
+            else AiePlioSharingMode.Single
+
+          require(sharingMode == requiredMode,
+            s"AIE PLIO sharing group '$groupLabel': '${member.subPEName}.${member.portName}' requires mode '$requiredMode'")
+          (request.portWidth, AiePlioSourceKind.ReadResponse, producerName)
+        }
+
+      val key = (member.subPEName, member.portName)
+      val firstPeIndex = nextPeIndex(key)
+      val endPeIndex = firstPeIndex + member.share
+      require(endPeIndex <= task.numProcessingElements,
+        s"AIE PLIO sharing group '$groupLabel': ${member.subPEName}.${member.portName} requests ${member.share} lanes starting at PE $firstPeIndex, but task '${task.name}' has only ${task.numProcessingElements} PEs")
+      nextPeIndex(key) = endPeIndex
+
+      // Match the AIE project's established endpoint naming convention while
+      // retaining the canonical subPE key for descriptor and RTL lookups.
+      val generatedSubPEName = member.subPEName.toLowerCase.replaceAll("[^a-z0-9_]", "")
+      val peIndices = (firstPeIndex until endPeIndex).toList
+      val logicalMembers = peIndices.map { index =>
+        val peSuffix = if (task.numProcessingElements > 1) s"_$index" else ""
+        s"${generatedSubPEName}${peSuffix}_${member.portName}"
+      }
+      val generatedName =
+        s"${generatedSubPEName}_${member.portName}_${sharingMode}_g$groupIndex"
+      val physicalGroup = AIEPlioPhysicalSharingGroupDescriptor(
+        name = generatedName,
+        direction = group.direction,
+        mode = sharingMode,
+        taskName = task.name,
+        subPEName = member.subPEName,
+        portName = member.portName,
+        peIndices = peIndices,
+        members = logicalMembers,
+        physicalPortName = generatedName,
+        physicalPlioWidth = group.physicalPlioWidth,
+        fifoDepth = group.fifoDepth,
+        logicalWidth = logicalWidth,
+        sourceKind = sourceKind,
+        sourceSubPEName = sourceSubPEName
+      )
+      physicalGroup.validate(this)
+      physicalGroup
+    }
+  }
+
   // --- All helper logic is kept here ---
   // Assign base addresses
   var j = 0
@@ -543,6 +816,15 @@ case class FullSysGenDescriptor(
 
   def validate(): Unit = {
     taskDescriptors.foreach(_.validate()) // Validate all sub-tasks
+    val physicalSharingGroups = expandedAiePlioSharingGroups
+
+    val physicalNames = physicalSharingGroups.map(_.effectivePhysicalPortName)
+    require(physicalNames.distinct.length == physicalNames.length,
+      "AIE PLIO sharing groups must have unique physical port names")
+    val sharedLogicalEndpoints = physicalSharingGroups.flatMap(group =>
+      group.peIndices.map(index => (group.subPEName, group.portName, index)))
+    require(sharedLogicalEndpoints.distinct.length == sharedLogicalEndpoints.length,
+      "A logical AIE endpoint may belong to only one AIE PLIO sharing group")
 
     require(isPow2(widthAddress) && widthAddress <= 64, "widthAddress must be power of 2 and <= 64")
     require(isPow2(widthContCounter) && widthContCounter <= 64, "widthContCounter must be power of 2 and <= 64")

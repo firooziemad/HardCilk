@@ -73,7 +73,7 @@ object ConnectivityTemplate {
 				buildSpLines(hardCilkInstance, helperKernels, hardCilkAxiPortCount) ++
 				Seq("") ++
 				buildTaskConnections(descriptor, hardCilkInstance, streamSplitters, aieEndpointByTask, helperKernels) ++
-				(if (helperKernels.nonEmpty) Seq("") ++ buildSubPEConnections(hardCilkInstance, helperKernels) else Seq.empty)
+				(if (helperKernels.nonEmpty) Seq("") ++ buildSubPEConnections(descriptor, hardCilkInstance, helperKernels) else Seq.empty)
 
 		val writer = new PrintWriter(s"$projectFolder/connectivity.cfg")
 		try {
@@ -267,6 +267,14 @@ object ConnectivityTemplate {
 
 		val directInputConnections = hcPeConnections
 			.filter(!_._4)
+			.filterNot { case (taskName, peIndex, pePortType, _) =>
+				descriptor.expandedAiePlioSharingGroups.exists(group =>
+					group.sourceKind == AiePlioSourceKind.HardCilkInput &&
+					group.taskName == taskName &&
+					group.peIndices.contains(peIndex) &&
+					group.portName == pePortType
+				)
+			}
 			.distinct
 			.map { case (taskName, peIndex, pePortType, fromPeToHardCilk) =>
 				val taskEndpoints = aieEndpointByTask.getOrElse(taskName, TaskAieEndpointDef(taskName, taskName, Map.empty, Map.empty))
@@ -280,8 +288,11 @@ object ConnectivityTemplate {
 			}
 
 		val outputConnections = buildTaskOutputConnections(descriptor, hardCilkInstance, aieEndpointByTask, streamSplitters, helperKernels)
+		val sharedInputConnections = descriptor.expandedAiePlioSharingGroups.map { group =>
+			s"sc=$hardCilkInstance.${group.effectivePhysicalPortName}:ai_engine_0.PLIO_${group.effectivePhysicalPortName}"
+		}
 
-		(directInputConnections ++ outputConnections)
+		(directInputConnections ++ sharedInputConnections ++ outputConnections)
 			.distinct
 			.sorted
 	}
@@ -372,26 +383,27 @@ object ConnectivityTemplate {
 					.toSeq
 					.sortBy(out => (outputPortPriority(out.portType), out.portType))
 
-				if (!isNonLastEndpoint || ordered.size <= 1) {
-					Seq.empty
-				} else {
-					val widths = ordered.map(_.bitWidth)
+				val groups =
+					if (isNonLastEndpoint && ordered.size > 1) Seq(ordered)
+					else if (ordered.size > 2) ordered.grouped(2).filter(_.size > 1).toSeq
+					else Seq.empty
+
+				groups.map { group =>
+					val widths = group.map(_.bitWidth)
 					val kernelName = s"StreamSplitter_${widths.mkString("_")}"
 					instanceCounterByKernel(kernelName) += 1
 					val instanceName = s"${kernelName}_${instanceCounterByKernel(kernelName)}"
 
-					Seq(
 						StreamSplitterDef(
 							kernelName = kernelName,
 							instanceName = instanceName,
 							taskName = taskName,
 							peIndex = peIndex,
 							aieEndpointName = endpointName,
-							aiePortType = ordered.map(_.portType).mkString("_"),
-							outputPortTypes = ordered.map(_.portType),
+							aiePortType = group.map(_.portType).mkString("_"),
+							outputPortTypes = group.map(_.portType),
 							outputWidths = widths
 						)
-					)
 				}
 			}
 	}
@@ -479,13 +491,23 @@ object ConnectivityTemplate {
 		x
 	}
 
-	private def buildSubPEConnections(hardCilkInstance: String, helperKernels: List[HelperKernelDef]): Seq[String] = {
+	private def buildSubPEConnections(
+			descriptor: FullSysGenDescriptor,
+			hardCilkInstance: String,
+			helperKernels: List[HelperKernelDef]
+	): Seq[String] = {
 		helperKernels.flatMap { k =>
 			(0 until k.taskPeCount).flatMap { peIndex =>
 				val peSuffix = suffixForPe(peIndex, k.taskPeCount)
 
 				if (k.requestType == "read") {
-					val chain = k.nextSubPE.map { nextName =>
+					val responseIsShared = descriptor.expandedAiePlioSharingGroups.exists { group =>
+						group.sourceKind == AiePlioSourceKind.ReadResponse &&
+						group.sourceSubPEName == k.subPEName &&
+						group.peIndices.contains(peIndex)
+					}
+
+					val chain = k.nextSubPE.filterNot(_ => responseIsShared).map { nextName =>
 						val nextSubPE = normalizeName(nextName)
 						val inPort =
 							if (k.mode == "stream") s"readStream${k.portWidth}In"
