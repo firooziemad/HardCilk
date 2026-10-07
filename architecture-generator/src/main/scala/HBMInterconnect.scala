@@ -52,17 +52,39 @@ trait HasHBMInterconnect extends Module {
   private val sharedHardCilkInputSinks =
     mutable.Map[(String, Int, String), (Int, axi4s.Interface)]()
   private val attachedSharedHardCilkInputs = mutable.Set[(String, Int, String)]()
+  private val sharedHardCilkOutputSources = mutable.Map[(String, Int, String), (Int, axi4s.Interface)]()
+  private val attachedSharedHardCilkOutputs = mutable.Set[(String, Int, String)]()
+  private val splitAieOutputSources =
+    mutable.Map[(String, Int, String, String), axi4s.Interface]()
+  private val attachedSplitAieOutputs = mutable.Set[(String, Int, String, String)]()
 
   private def getOrCreatePeIO(task: TaskDescriptor): PeIO = {
     peIOByTaskName.getOrElseUpdate(task.name, {
       val subPEs = fullSysGenDescriptor.subPEList.filter(_._2.peName == task.name)
       val sharingGroups = fullSysGenDescriptor.expandedAiePlioSharingGroups
         .filter(_.taskName == task.name)
+      val outputSplitterGroups = StreamSplitterPlan.groups(fullSysGenDescriptor)
+        .filter(_.taskName == task.name)
+      val directCreditRoutes = sharingGroups.filter(g => g.direction == "plToAie" &&
+        !g.creditReturnPort.startsWith("read") && !g.creditReturnPort.startsWith("write"))
+        .flatMap { g => g.peIndices.filterNot(i => outputSplitterGroups.exists(s =>
+          s.peIndex == i && s.creditGroups.exists(_.name == g.name))).map { i =>
+          val connections = fullSysGenDescriptor.getSystemConnectionsDescriptor().connections
+            .filter(c => c.srcPort.parentType == "PE" &&
+              c.srcPort.parentName == task.name && c.srcPort.parentIndex == i &&
+              c.srcPort.portType == g.creditReturnPort && c.dstPort.parentType == "HardCilk")
+          require(connections.nonEmpty,
+            s"Missing direct credit output ${task.name}[$i].${g.creditReturnPort}")
+          StreamSplitterDataRoute(task.name, i, g.subPEName, g.creditReturnPort,
+            connections.map(_.bitWidth).max)
+        }}.distinct
       Module(new PeIO(
         subPEs,
         task.numProcessingElements,
         task.name,
-        sharingGroups
+        sharingGroups,
+        outputSplitterGroups,
+        directCreditRoutes
       ))
     })
   }
@@ -73,8 +95,10 @@ trait HasHBMInterconnect extends Module {
    * This is called before missing PE ports are attached.
    */
   def prepareAiePlioSharing(): Unit = {
-    fullSysGenDescriptor.expandedAiePlioSharingGroups
-      .map(_.taskName)
+    // Tagged outputs also exist without shared forward inputs (e.g. Exp3).
+    // Export their splitter ingress before attaching any logical PE outputs.
+    (fullSysGenDescriptor.expandedAiePlioSharingGroups.map(_.taskName) ++
+      StreamSplitterPlan.groups(fullSysGenDescriptor).map(_.taskName))
       .distinct
       .foreach { taskName =>
         val task = fullSysGenDescriptor.taskDescriptors
@@ -84,6 +108,29 @@ trait HasHBMInterconnect extends Module {
           ))
         val peIO = getOrCreatePeIO(task)
 
+        peIO.splitPhysicalInputs.foreach { splitInput =>
+          val port = IO(chiselTypeOf(splitInput.sink))
+            .suggestName(splitInput.group.physicalPortName)
+          port.asLite :=> splitInput.sink.asLite
+        }
+
+        peIO.splitDataOutputs.foreach { output =>
+          val key = (output.route.taskName, output.route.peIndex,
+            output.route.endpointName, output.route.portType)
+          require(!splitAieOutputSources.contains(key),
+            s"AIE output ${key._1}[${key._2}].${key._3} belongs to more than one splitter")
+          splitAieOutputSources(key) = output.source
+        }
+
+        peIO.directCreditOutputs.foreach { case (route, input, output) =>
+          val physical = IO(chiselTypeOf(input))
+            .suggestName(s"BindTo_PE_${route.taskName}_${route.peIndex}_${route.portType}")
+          physical.asLite :=> input.asLite
+          val key = (route.taskName, route.peIndex, route.endpointName, route.portType)
+          require(!splitAieOutputSources.contains(key), s"Duplicate direct credit endpoint $key")
+          splitAieOutputSources(key) = output
+        }
+
         peIO.sharedHardCilkInputs.foreach { sharedInput =>
           val key = (sharedInput.taskName, sharedInput.index, sharedInput.portName)
           require(!sharedHardCilkInputSinks.contains(key),
@@ -91,15 +138,32 @@ trait HasHBMInterconnect extends Module {
           sharedHardCilkInputSinks(key) = (sharedInput.logicalWidth, sharedInput.sink)
         }
 
+        peIO.sharedHardCilkOutputs.foreach { sharedOutput =>
+          val key = (sharedOutput.taskName, sharedOutput.index, sharedOutput.portName)
+          require(!sharedHardCilkOutputSources.contains(key),
+            s"HardCilk output $key belongs to more than one packet decoder")
+          sharedHardCilkOutputSources(key) = (sharedOutput.logicalWidth, sharedOutput.source)
+        }
+        peIO.sharedPacketInputs.foreach { packetInput =>
+          val physical = IO(chiselTypeOf(packetInput.sink))
+            .suggestName(packetInput.physicalPortName)
+          physical.asFull :=> packetInput.sink.asFull
+        }
+        peIO.sharedPackedOutputs.foreach { packed =>
+          val physical = IO(chiselTypeOf(packed.source))
+            .suggestName(packed.physicalPortName)
+          packed.source.asLite :=> physical.asLite
+        }
+
         peIO.sharedPacketOutputs.foreach { sharedOutput =>
           val physical = IO(chiselTypeOf(sharedOutput.source))
             .suggestName(sharedOutput.physicalPortName)
           sharedOutput.source.asFull :=> physical.asFull
         }
+
       }
   }
 
-  /** Returns true when PeIO consumes this HardCilk-to-PE input. */
   def attachAieSharedTaskInput(
       taskName: String,
       peIndex: Int,
@@ -122,10 +186,62 @@ trait HasHBMInterconnect extends Module {
     }
   }
 
+  def attachAieSharedTaskOutput(
+      taskName: String, peIndex: Int, portType: String, hardCilkPort: Data
+  ): Boolean = {
+    val key = (taskName, peIndex, portType)
+    sharedHardCilkOutputSources.get(key) match {
+      case None => false
+      case Some((expectedWidth, source)) =>
+        require(!attachedSharedHardCilkOutputs.contains(key),
+          s"HardCilk output $key was attached more than once")
+        val stream = hardCilkPort.asInstanceOf[axi4s.Interface]
+        require(stream.cfg.wData == expectedWidth && stream.cfg.onlyRV,
+          s"HardCilk output $key must be a $expectedWidth-bit ready/valid AXI stream")
+        source.asLite :=> stream.asLite
+        attachedSharedHardCilkOutputs += key
+        true
+    }
+  }
+
   def validateAieSharedTaskInputs(): Unit = {
     val missing = sharedHardCilkInputSinks.keySet.toSet -- attachedSharedHardCilkInputs
     require(missing.isEmpty,
       s"Configured AIE packet-mux HardCilk inputs were not found: ${missing.toSeq.sorted.mkString(", ")}")
+    val missingOutputs = sharedHardCilkOutputSources.keySet.toSet -- attachedSharedHardCilkOutputs
+    require(missingOutputs.isEmpty,
+      s"Configured AIE packet-demux HardCilk outputs were not found: ${missingOutputs.toSeq.sorted.mkString(", ")}")
+
+  }
+
+  def attachSplitAieOutput(
+      taskName: String,
+      peIndex: Int,
+      portType: String,
+      hardCilkPort: Data,
+      endpointName: Option[String] = None
+  ): Boolean = {
+    val candidates = splitAieOutputSources.filter { case ((task, index, endpoint, port), _) =>
+      task == taskName && index == peIndex && port == portType &&
+        endpointName.forall(_ == endpoint)
+    }.toSeq
+    require(candidates.size <= 1,
+      s"AIE output $taskName[$peIndex].$portType is ambiguous; specify its endpoint")
+    candidates.headOption match {
+      case None => false
+      case Some((key, source)) =>
+        require(!attachedSplitAieOutputs(key),
+          s"AIE output $taskName[$peIndex].$portType was attached more than once")
+        source.asLite :=> hardCilkPort.asInstanceOf[axi4s.Interface].asLite
+        attachedSplitAieOutputs += key
+        true
+    }
+  }
+
+  def validateSplitAieOutputs(): Unit = {
+    val missing = splitAieOutputSources.keySet.toSet -- attachedSplitAieOutputs
+    require(missing.isEmpty,
+      s"Configured internal AIE splitter outputs were not attached: ${missing.toSeq.sorted.mkString(", ")}")
   }
 
   /**
@@ -170,9 +286,21 @@ trait HasHBMInterconnect extends Module {
         }
         peIO.rwPorts.foreach { rwPort =>
           println(s"[HBMInterconnect] Adding PE IO ports for task ${rwPort.subPEName}_${rwPort.index}")
-          val sourceTask =
-            IO(chiselTypeOf(rwPort.sourceTask)).suggestName(s"${rwPort.instanceName}_sourceTask")
-          sourceTask.asLite :=> rwPort.sourceTask.asLite
+          val request = subPEs(rwPort.subPEName).rwRequest.get
+          val portType = (request.`type`, request.mode) match {
+            case ("read", "single") => s"readSingle${request.portWidth}Out"
+            case ("read", "stream") => s"readStream${request.portWidth}Out"
+            case ("write", "single") => s"writeSingle${request.portWidth}Out"
+            case ("write", "stream") => s"writeStream${request.portWidth}Out"
+          }
+          val endpointName = rwPort.subPEName.toLowerCase.replaceAll("[^a-z0-9_]", "")
+          if (!peIO.sharedRwRequestKeys.contains((rwPort.subPEName, rwPort.index)) &&
+              !attachSplitAieOutput(task.name, rwPort.index, portType,
+                rwPort.sourceTask, Some(endpointName))) {
+            val sourceTask = IO(chiselTypeOf(rwPort.sourceTask))
+              .suggestName(s"${rwPort.instanceName}_sourceTask")
+            sourceTask.asLite :=> rwPort.sourceTask.asLite
+          }
 
           rwPort.sinkResult
             .filterNot(_ => peIO.sharedReadResponseKeys.contains((rwPort.subPEName, rwPort.index)))
@@ -235,8 +363,16 @@ trait HasHBMInterconnect extends Module {
 
     if (totalPorts > 0) {
         val numPortsPerMux = totalPorts.toDouble / numHBMPorts.toDouble
-        val peMux = math.max(1, math.ceil(1.0 * interfacesPE.length / numPortsPerMux).toInt)
-        val serverMux = math.max(0, numHBMPorts - peMux)
+        // Reserve an exported memory port for scheduler/notifier traffic.
+        // At high PE counts ceil(PE / average) can otherwise consume every
+        // port, silently dropping all server interfaces from hbmSlaves.
+        val hasServers = totalPorts > interfacesPE.length
+        require(numHBMPorts >= (if (interfacesPE.nonEmpty && hasServers) 2 else 1),
+          "Separate PE/server memory muxes require at least two AXI ports")
+        val peMux = if (interfacesPE.isEmpty) 0 else math.min(
+          numHBMPorts - (if (hasServers) 1 else 0),
+          math.max(1, math.ceil(1.0 * interfacesPE.length / numPortsPerMux).toInt))
+        val serverMux = numHBMPorts - peMux
 
         val pePortsPerMux = if (peMux > 0 && interfacesPE.length > 0) 1.0 * interfacesPE.length / peMux else 1.0
 
@@ -257,6 +393,9 @@ trait HasHBMInterconnect extends Module {
           })
     }
 
+
+    require(hbmSlaves.values.map(_.size).sum == totalPorts,
+      "Every memory interface must be assigned to an exported AXI port")
 
     if (false){//!isSimulation) {
       val xdma_axi = IO(axi4.Slave(cfgXDMA)).suggestName("s_axi_xdma")

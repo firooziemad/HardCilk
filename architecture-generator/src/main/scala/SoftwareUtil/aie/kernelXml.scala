@@ -3,6 +3,7 @@ package SoftwareUtil.aie
 import Descriptors._
 import java.io.PrintWriter
 import scala.collection.mutable
+import aiehelpers.StreamSplitterPlan
 
 object KernelXmlTemplate {
 
@@ -61,16 +62,18 @@ object KernelXmlTemplate {
       topWriter.close()
     }
 
-    buildStreamSplitterXmlDefs(descriptor).foreach { splitter =>
-      val file = new java.io.File(xmlFolder, s"${splitter.kernelName}.xml")
-      val writer = new PrintWriter(file)
-      try {
-        writer.write(renderStreamSplitterXml(splitter) + "\n")
-      } finally {
-        writer.close()
-      }
-    }
   }
+
+  /**
+    * Splitter variants required by the generated graph. RTL and XML generation
+    * share this calculation so kernel names and interfaces cannot drift.
+    */
+  def requiredStreamSplitterWidths(
+      descriptor: FullSysGenDescriptor
+  ): Seq[Vector[Int]] =
+    StreamSplitterPlan.groups(descriptor)
+      .map(_.outputWidths)
+      .distinct
 
   private def sourceTaskDataWidth(req: RWRequestDescriptor): Int = {
     val addressWidth = 64
@@ -93,7 +96,7 @@ object KernelXmlTemplate {
     outputsByTaskPeEndpoint
       .toSeq
       .sortBy { case ((taskName, peIndex, endpointName), _) => (taskName, peIndex, endpointName) }
-      .flatMap { case ((taskName, _, endpointName), outputs) =>
+      .flatMap { case ((taskName, peIndex, endpointName), outputs) =>
         val isNonLastEndpoint = nonLastEndpointsByTask.getOrElse(taskName, Set.empty).contains(endpointName)
         val ordered = outputs
           .groupBy(_.portType)
@@ -101,17 +104,34 @@ object KernelXmlTemplate {
           .toSeq
           .sortBy(out => (outputPortPriority(out.portType), out.portType))
 
-        val groups =
+
+        val endpointCredits = descriptor.expandedAiePlioSharingGroups
+          .filter(group => group.sourceKind == AiePlioSourceKind.HardCilkInput &&
+            group.taskName == taskName && group.peIndices.contains(peIndex) &&
+            normalizeName(group.subPEName) == endpointName)
+          .sortBy(_.name)
+        endpointCredits.foreach { credit =>
+          require(ordered.exists(_.portType == credit.creditReturnPort),
+            s"AIE PLIO sharing group ${credit.name} returns credit on ${credit.creditReturnPort}, " +
+              s"but AIE endpoint $endpointName has no such output")
+        }
+
+        val baseGroups =
           if (isNonLastEndpoint && ordered.size > 1) Seq(ordered)
           else if (ordered.size > 2) ordered.grouped(2).filter(_.size > 1).toSeq
           else Seq.empty
+        val groupedPorts = baseGroups.flatten.map(_.portType).toSet
+        val creditedSingletons = endpointCredits.map(_.creditReturnPort).distinct
+          .filterNot(groupedPorts).map(port => Seq(ordered.find(_.portType == port).get))
 
-        groups.map { group =>
-          val widths = group.map(_.bitWidth)
-            StreamSplitterXmlDef(
-              kernelName = s"StreamSplitter_${widths.mkString("_")}",
-              outputWidths = widths
-            )
+        (baseGroups ++ creditedSingletons).map { dataGroup =>
+          val creditCount = endpointCredits.count(credit =>
+            dataGroup.exists(_.portType == credit.creditReturnPort))
+          val widths = dataGroup.map(_.bitWidth) ++ Seq.fill(creditCount)(32)
+          StreamSplitterXmlDef(
+            kernelName = s"StreamSplitter_${widths.mkString("_")}",
+            outputWidths = widths
+          )
         }
       }
       .distinctBy(_.kernelName)
@@ -320,6 +340,17 @@ object KernelXmlTemplate {
 
   private def buildTopStreamPortDefs(descriptor: FullSysGenDescriptor): Seq[TopStreamPortDef] = {
     val ports = mutable.ArrayBuffer[TopStreamPortDef]()
+	val splitterGroups = StreamSplitterPlan.groups(descriptor)
+	val splitRoutes = splitterGroups.flatMap(_.dataRoutes)
+	  .map(route => (route.taskName, route.peIndex, route.portType)).toSet
+	val splitRwRoutes = splitterGroups.flatMap(_.dataRoutes)
+	  .map(route => (route.taskName, route.peIndex, route.endpointName, route.portType)).toSet
+	val sharedHardCilkOutputs = descriptor.expandedAiePlioSharingGroups
+      .filter(_.sourceKind == AiePlioSourceKind.HardCilkOutput)
+      .flatMap(g => g.peIndices.map(i => (g.taskName, i, g.portName))).toSet
+    val sharedRwRequests = descriptor.expandedAiePlioSharingGroups
+      .filter(_.sourceKind == AiePlioSourceKind.RwRequest)
+      .flatMap(g => g.peIndices.map(i => (g.subPEName, i))).toSet
 	val sharedHardCilkInputs = descriptor.expandedAiePlioSharingGroups
 	  .filter(_.sourceKind == AiePlioSourceKind.HardCilkInput)
 	  .flatMap(group =>
@@ -337,7 +368,9 @@ object KernelXmlTemplate {
           mode = "write_only",
           bitWidth = connection.bitWidth
         )
-      } else if (src.parentType == "PE" && dst.parentType == "HardCilk") {
+      } else if (src.parentType == "PE" && dst.parentType == "HardCilk" &&
+          !splitRoutes((src.parentName, src.parentIndex, src.portType)) &&
+          !sharedHardCilkOutputs((src.parentName, src.parentIndex, src.portType))) {
         ports += TopStreamPortDef(
           bindPortName = s"BindTo_PE_${src.parentName}_${src.parentIndex}_${src.portType}",
           mode = "read_only",
@@ -350,14 +383,18 @@ object KernelXmlTemplate {
       val spawnNextWidth = getSpawnNextBundleWidthBits(descriptor, task)
       val argDataOutWidth = getArgDataOutBundleWidthBits(descriptor, task)
       (0 until task.numProcessingElements).foreach { peIndex =>
-        if (task.generateArgOutWriteBuffer) {
+        if (task.generateArgOutWriteBuffer &&
+            !splitRoutes((task.name, peIndex, "argDataOut")) &&
+            !sharedHardCilkOutputs((task.name, peIndex, "argDataOut"))) {
           ports += TopStreamPortDef(
             bindPortName = s"BindTo_PE_${task.name}_${peIndex}_argDataOut",
             mode = "read_only",
             bitWidth = argDataOutWidth
           )
         }
-        if (task.generateSpawnNextWriteBuffer) {
+        if (task.generateSpawnNextWriteBuffer &&
+            !splitRoutes((task.name, peIndex, "spawnNext")) &&
+            !sharedHardCilkOutputs((task.name, peIndex, "spawnNext"))) {
           ports += TopStreamPortDef(
             bindPortName = s"BindTo_PE_${task.name}_${peIndex}_spawnNext",
             mode = "read_only",
@@ -371,11 +408,19 @@ object KernelXmlTemplate {
       sub.rwRequest.foreach { req =>
         descriptor.taskDescriptors.find(_.name == sub.peName).foreach { task =>
           (0 until task.numProcessingElements).foreach { peIndex =>
-            ports += TopStreamPortDef(
-              bindPortName = rwTopPortName(subPEName, peIndex, "sourceTask"),
-              mode = "write_only",
-              bitWidth = sourceTaskDataWidth(req)
-            )
+            val rwPortType = rwOutputPortName(req)
+            // portType alone is not unique within a task: several helper
+            // kernels can all emit (for example) readSingle64Out. Only
+            // suppress this helper's XO port when this exact AIE endpoint is
+            // routed through a PL-side StreamSplitter.
+            if (!splitRwRoutes((sub.peName, peIndex, normalizeName(subPEName), rwPortType)) &&
+                !sharedRwRequests((subPEName, peIndex))) {
+              ports += TopStreamPortDef(
+                bindPortName = rwTopPortName(subPEName, peIndex, "sourceTask"),
+                mode = "write_only",
+                bitWidth = sourceTaskDataWidth(req)
+              )
+            }
 
             if (req.`type` == "read") {
               val responseIsShared = descriptor.expandedAiePlioSharingGroups.exists { group =>
@@ -397,10 +442,32 @@ object KernelXmlTemplate {
     }
 
     descriptor.expandedAiePlioSharingGroups.foreach { group =>
+      if (group.sourceKind == AiePlioSourceKind.PackedOutput &&
+          !splitterGroups.exists(s => s.taskName == group.taskName &&
+            group.peIndices.contains(s.peIndex) && s.aiePortType == group.portName &&
+            s.endpointName == group.subPEName.toLowerCase.replaceAll("[^a-z0-9_]", ""))) {
+        group.peIndices.foreach { peIndex =>
+          ports += TopStreamPortDef(s"${group.name}_packed_$peIndex", "read_only", group.logicalWidth)
+        }
+      }
       ports += TopStreamPortDef(
         bindPortName = group.effectivePhysicalPortName,
-        mode = "write_only",
+        mode = if (group.direction == "plToAie") "write_only" else "read_only",
         bitWidth = group.packetPortWidth
+      )
+    }
+
+    splitterGroups.filterNot { split =>
+      descriptor.expandedAiePlioSharingGroups.exists(g =>
+        g.sourceKind == AiePlioSourceKind.PackedOutput &&
+          g.taskName == split.taskName && g.peIndices.contains(split.peIndex) &&
+          g.portName == split.aiePortType &&
+          g.subPEName.toLowerCase.replaceAll("[^a-z0-9_]", "") == split.endpointName)
+    }.foreach { group =>
+      ports += TopStreamPortDef(
+        bindPortName = group.physicalPortName,
+        mode = "read_only",
+        bitWidth = group.outputWidths.max + 128
       )
     }
 

@@ -238,8 +238,8 @@ case class AIEPlioSharingMemberDescriptor(
       s"AIE PLIO sharing group '$groupLabel': invalid subPEName '$subPEName'")
     require(portName.matches("[A-Za-z_][A-Za-z0-9_]*"),
       s"AIE PLIO sharing group '$groupLabel': invalid portName '$portName'")
-    require(share >= 2 && share <= 32,
-      s"AIE PLIO sharing group '$groupLabel': share must be between 2 and 32")
+    require(Set(2, 4).contains(share),
+      s"AIE PLIO sharing group '$groupLabel': V9 verified FIFO-backed sharing supports only share=2 or share=4")
   }
 }
 
@@ -256,25 +256,65 @@ case class AIEPlioSharingGroupDescriptor(
     mode: String,
     members: List[AIEPlioSharingMemberDescriptor],
     physicalPlioWidth: Int = 128,
-    fifoDepth: Int = 2
+    fifoDepth: Int = 2,
+    creditCapacity: Int = 1,
+    initialCredits: Int = 1,
+    creditReturnPort: String = "argOut",
+    creditTiming: String = AiePlioCreditTiming.BeforeReceive,
+    aieFifoDepth: Int = 0,
+    segmentBeats: Int = 0,
+    lengthDriven: Boolean = false,
+    logicalWidth: Int = 0
 ) {
   def label(index: Int): String = s"group_$index"
 
   def validate(index: Int): Unit = {
     val groupLabel = label(index)
-    require(direction == "plToAie",
-      s"AIE PLIO sharing group '$groupLabel': PL-to-AIE packet muxes support only plToAie")
+    require(Set("plToAie", "aieToPl").contains(direction),
+      s"AIE PLIO sharing group '$groupLabel': direction must be plToAie or aieToPl")
     require(Set(AiePlioSharingMode.Single, AiePlioSharingMode.Stream).contains(mode),
       s"AIE PLIO sharing group '$groupLabel': mode must be 'single' or 'stream'")
     require(members.nonEmpty,
       s"AIE PLIO sharing group '$groupLabel': members must not be empty")
     require(members.length == 1,
       s"AIE PLIO sharing group '$groupLabel': packet muxes currently support exactly one homogeneous member")
-    members.foreach(_.validate(groupLabel))
+    members.foreach { member =>
+      if (direction == "plToAie") member.validate(groupLabel)
+      else {
+        require(member.subPEName.matches("[A-Za-z_][A-Za-z0-9_]*") &&
+          member.portName.matches("[A-Za-z_][A-Za-z0-9_]*") &&
+          member.share >= 2 && member.share <= 32,
+          s"AIE PLIO sharing group '$groupLabel': invalid output member or share")
+      }
+    }
     require(Set(32, 64, 128).contains(physicalPlioWidth),
       s"AIE PLIO sharing group '$groupLabel': physicalPlioWidth must be 32, 64, or 128")
     require(fifoDepth > 0,
       s"AIE PLIO sharing group '$groupLabel': fifoDepth must be positive")
+    require(logicalWidth >= 0 && logicalWidth % 32 == 0,
+      s"AIE PLIO sharing group '$groupLabel': optional logicalWidth must be a multiple of 32")
+    if (direction == "aieToPl") {
+      require(mode == AiePlioSharingMode.Single && physicalPlioWidth == 32,
+        s"AIE PLIO sharing group '$groupLabel': direct output sharing requires single mode and a 32-bit PLIO")
+      return
+    }
+    require(Set(AiePlioCreditTiming.BeforeReceive, AiePlioCreditTiming.AfterConsume,
+      AiePlioCreditTiming.IterationEnd).contains(creditTiming),
+      s"AIE PLIO sharing group '$groupLabel': invalid creditTiming")
+    require(creditCapacity > 0,
+      s"AIE PLIO sharing group '$groupLabel': creditCapacity must be positive")
+    require(initialCredits >= 0 && initialCredits <= creditCapacity,
+      s"AIE PLIO sharing group '$groupLabel': initialCredits must be in [0, creditCapacity]")
+    require(aieFifoDepth >= 0,
+      s"AIE PLIO sharing group '$groupLabel': aieFifoDepth must be non-negative")
+    require(segmentBeats >= 0,
+      s"AIE PLIO sharing group '$groupLabel': segmentBeats must be non-negative")
+    require(creditReturnPort.matches("[A-Za-z_][A-Za-z0-9_]*"),
+      s"AIE PLIO sharing group '$groupLabel': invalid creditReturnPort '$creditReturnPort'")
+    if (mode == AiePlioSharingMode.Stream) {
+      require(segmentBeats > 0 && lengthDriven,
+        s"AIE PLIO sharing group '$groupLabel': V5 stream mode requires segmentBeats > 0 and lengthDriven=true")
+    }
   }
 }
 
@@ -283,9 +323,19 @@ object AiePlioSharingMode {
   val Stream = "stream"
 }
 
+
+object AiePlioCreditTiming {
+  val BeforeReceive = "beforeReceive"
+  val AfterConsume = "afterConsume"
+  val IterationEnd = "iterationEnd"
+}
+
 object AiePlioSourceKind {
   val HardCilkInput = "hardCilkInput"
   val ReadResponse = "readResponse"
+  val HardCilkOutput = "hardCilkOutput"
+  val RwRequest = "rwRequest"
+  val PackedOutput = "packedOutput"
 }
 
 /** Fully expanded physical group consumed by RTL and AIE generators. */
@@ -303,17 +353,48 @@ case class AIEPlioPhysicalSharingGroupDescriptor(
     fifoDepth: Int,
     logicalWidth: Int,
     sourceKind: String,
-    sourceSubPEName: String
+    sourceSubPEName: String,
+    creditCapacity: Int,
+    initialCredits: Int,
+    creditReturnPort: String,
+    creditTiming: String,
+    aieFifoDepth: Int,
+    segmentBeats: Int,
+    lengthDriven: Boolean,
+    creditTag: Int
 ) {
   @transient private var resolvedPacketIds: Vector[Int] = Vector.empty
 
   def fanIn: Int = peIndices.length
 
+  /** Number of 32-bit payload words reserved by one admission credit. */
+  def receiveUnitWords: Int = {
+    require(logicalWidth > 0 && logicalWidth % 32 == 0,
+      s"AIE PLIO sharing group '$name': logical width must be a positive multiple of 32")
+    val beats = if (mode == AiePlioSharingMode.Stream) segmentBeats else 1
+    (logicalWidth / 32) * beats
+  }
+
+  /** Exact requested FIFO depth for every packet-split destination branch. */
+  def receiveFifoDepths: Vector[Int] =
+    Vector.tabulate(fanIn)(lane => aieFifoDepth + lane)
+
+  /** Complete fixed records or bounded segments held by each receive FIFO. */
+  def receiveCreditCapacities: Vector[Int] =
+    receiveFifoDepths.map(_ / receiveUnitWords)
+
   def effectivePhysicalPortName: String =
     if (physicalPortName.nonEmpty) physicalPortName else name
+  def creditReturnPhysicalPortName(peIndex: Int): String = {
+    require(peIndices.contains(peIndex),
+      s"AIE PLIO sharing group '$name' does not contain PE $peIndex")
+    s"${name}_credit_$peIndex"
+  }
+  def segmented: Boolean = segmentBeats > 0
 
   def packetPortWidth: Int =
     mode match {
+      case AiePlioSharingMode.Single if direction == "aieToPl" => physicalPlioWidth
       case AiePlioSharingMode.Single => logicalWidth + 32
       case AiePlioSharingMode.Stream => physicalPlioWidth
       case other => throw new IllegalArgumentException(
@@ -343,10 +424,10 @@ case class AIEPlioPhysicalSharingGroupDescriptor(
       s"AIE PLIO sharing group '$name': invalid group name")
     require(effectivePhysicalPortName.matches("[A-Za-z_][A-Za-z0-9_]*"),
       s"AIE PLIO sharing group '$name': invalid physicalPortName")
-    require(direction == "plToAie",
-      s"AIE PLIO sharing group '$name': PL-to-AIE packet muxes support only plToAie")
-    require(fanIn >= 2 && fanIn <= 32,
-      s"AIE PLIO sharing group '$name': fan-in must be between 2 and 32")
+    require(Set("plToAie", "aieToPl").contains(direction),
+      s"AIE PLIO sharing group '$name': unsupported direction '$direction'")
+    require(if (direction == "plToAie") Set(2, 4).contains(fanIn) else fanIn >= 2 && fanIn <= 32,
+      s"AIE PLIO sharing group '$name': unsupported fan-in $fanIn")
     require(members.length == fanIn,
       s"AIE PLIO sharing group '$name': peIndices and members must have the same length")
     require(peIndices.distinct.length == peIndices.length,
@@ -359,8 +440,48 @@ case class AIEPlioPhysicalSharingGroupDescriptor(
       s"AIE PLIO sharing group '$name': fifoDepth must be positive")
     require(Set(AiePlioSharingMode.Single, AiePlioSharingMode.Stream).contains(mode),
       s"AIE PLIO sharing group '$name': mode must be 'single' or 'stream'")
+    if (direction == "aieToPl") {
+      require(mode == AiePlioSharingMode.Single && physicalPlioWidth == 32,
+        s"AIE PLIO sharing group '$name': direct output sharing requires single mode and a 32-bit PLIO")
+      require(logicalWidth > 0 && logicalWidth % 32 == 0,
+        s"AIE PLIO sharing group '$name': output record width must be a positive multiple of 32")
+      require(Set(AiePlioSourceKind.HardCilkOutput, AiePlioSourceKind.RwRequest,
+        AiePlioSourceKind.PackedOutput).contains(sourceKind),
+        s"AIE PLIO sharing group '$name': unsupported output source '$sourceKind'")
+      val task = descriptor.taskDescriptors.find(_.name == taskName).getOrElse(
+        throw new IllegalArgumentException(s"AIE PLIO sharing group '$name': unknown task '$taskName'"))
+      require(peIndices.forall(i => i >= 0 && i < task.numProcessingElements),
+        s"AIE PLIO sharing group '$name': PE index out of range")
+      return
+    }
+    require(Set(AiePlioCreditTiming.BeforeReceive, AiePlioCreditTiming.AfterConsume,
+      AiePlioCreditTiming.IterationEnd).contains(creditTiming),
+      s"AIE PLIO sharing group '$name': unsupported V5 creditTiming '$creditTiming'")
+    require(creditCapacity > 0 && initialCredits >= 0 && initialCredits <= creditCapacity,
+      s"AIE PLIO sharing group '$name': invalid V5 credit bounds")
+    require(aieFifoDepth >= 0 && segmentBeats >= 0,
+      s"AIE PLIO sharing group '$name': FIFO depth and segment size must be non-negative")
+    require(creditReturnPort.matches("[A-Za-z_][A-Za-z0-9_]*"),
+        s"AIE PLIO sharing group '$name': invalid creditReturnPort '$creditReturnPort'")
+    if (mode == AiePlioSharingMode.Stream) {
+    require(creditTag >= 0,
+      s"AIE PLIO sharing group '$name': creditTag must be non-negative")
+      require(segmentBeats > 0 && lengthDriven,
+        s"AIE PLIO sharing group '$name': V5 stream mode requires segmentBeats > 0 and lengthDriven=true")
+    }
     require(logicalWidth > 0 && logicalWidth % 8 == 0,
       s"AIE PLIO sharing group '$name': logical width must be a positive multiple of eight")
+    require(creditTiming == AiePlioCreditTiming.AfterConsume,
+      s"AIE PLIO sharing group '$name': V9 FIFO-backed credits must return after consumption")
+    require(creditCapacity == 1 && initialCredits == 1,
+      s"AIE PLIO sharing group '$name': creditCapacity and initialCredits are compatibility markers fixed at 1; V9 derives actual per-lane credits from receive FIFO capacity")
+    val unitBytes = (logicalWidth / 8) * (if (mode == AiePlioSharingMode.Stream) segmentBeats else 1)
+    require(logicalWidth % 32 == 0 && unitBytes > 0 && unitBytes <= 4096,
+      s"AIE PLIO sharing group '$name': slot must contain 1..1024 complete 32-bit words")
+    require(aieFifoDepth > 0 && aieFifoDepth + fanIn - 1 < 40,
+      s"AIE PLIO sharing group '$name': distinct per-branch stream-switch FIFO depths must remain in [1,39]")
+    require(receiveCreditCapacities.forall(_ > 0),
+      s"AIE PLIO sharing group '$name': every receive FIFO must hold at least one complete record or segment")
     if (mode == AiePlioSharingMode.Stream) {
       require(logicalWidth >= 8 && isPow2(logicalWidth),
         s"AIE PLIO sharing group '$name': stream mode requires a byte-aligned power-of-two logical width")
@@ -432,8 +553,8 @@ case class FullSysGenDescriptor(
         throw new IllegalArgumentException(
           s"AIE PLIO sharing group '$groupLabel': subPE '${member.subPEName}' references unknown task '${subPE.peName}'"))
 
-      val isHardCilkInput =
-        member.portName == "taskIn" || subPE.taskInputPorts.contains(member.portName)
+      val isHardCilkInput = group.direction == "plToAie" &&
+        (member.portName == "taskIn" || subPE.taskInputPorts.contains(member.portName))
 
       val incomingReadResponses = subPEList.toSeq.flatMap {
         case (sourceSubPEName, sourceSubPE) if sourceSubPE.peName == task.name =>
@@ -443,17 +564,72 @@ case class FullSysGenDescriptor(
               (sourceSubPEName, req, s"read${mode}${req.portWidth}In")
           }
         case _ => Seq.empty
-      }.filter(_._3 == member.portName)
+      }.filter(_._3 == member.portName && group.direction == "plToAie")
 
-      require(isHardCilkInput || incomingReadResponses.nonEmpty,
-        s"AIE PLIO sharing group '$groupLabel': '${member.subPEName}.${member.portName}' is neither an exposed HardCilk input nor a read-response input")
+      val outputConnections = getSystemConnectionsDescriptor().connections.collect {
+        case connection if group.direction == "aieToPl" &&
+          connection.srcPort.parentType == "PE" &&
+          connection.srcPort.parentName == task.name &&
+          connection.srcPort.portType == member.portName => connection.bitWidth
+      }
+      val generatedOutputWidth = if (group.direction == "aieToPl") {
+        if (member.portName == "argDataOut" && task.generateArgOutWriteBuffer)
+          Some(nextPow2(widthAddress + task.argumentSizeList.headOption.getOrElse(0) + 64))
+        else if (member.portName == "spawnNext" && task.generateSpawnNextWriteBuffer) {
+          val targetWidth = spawnNextList.getOrElse(task.name, List.empty)
+            .flatMap(target => taskDescriptors.find(_.name == target).map(_.widthTask))
+            .foldLeft(task.widthTask)(math.max)
+          val allowWidth = if (task.variableSpawn) 0 else
+            32 * (1 + spawnList.getOrElse(task.name, List.empty).count(_ != task.name))
+          Some(nextPow2(widthAddress + targetWidth + 32 + allowWidth))
+        } else None
+      } else None
+      val rwOutput = subPE.rwRequest.filter(_ => group.direction == "aieToPl")
+        .filter { req =>
+          member.portName == s"${req.`type`}${if (req.mode == "single") "Single" else "Stream"}${req.portWidth}Out"
+        }
+      val taggedCreditOutput = group.direction == "aieToPl" &&
+        aiePlioSharingGroups.exists(input => input.direction == "plToAie" &&
+          input.members.head.subPEName == member.subPEName &&
+          input.creditReturnPort == member.portName)
+      val packedOutput = group.direction == "aieToPl" &&
+        (taggedCreditOutput || (group.logicalWidth > 0 && outputConnections.isEmpty &&
+          generatedOutputWidth.isEmpty && rwOutput.isEmpty))
+      require(isHardCilkInput || incomingReadResponses.nonEmpty || outputConnections.nonEmpty ||
+        generatedOutputWidth.nonEmpty || rwOutput.nonEmpty || packedOutput,
+        s"AIE PLIO sharing group '$groupLabel': '${member.subPEName}.${member.portName}' is not a generated logical endpoint")
       require(!(isHardCilkInput && incomingReadResponses.nonEmpty),
         s"AIE PLIO sharing group '$groupLabel': '${member.subPEName}.${member.portName}' resolves ambiguously")
       require(incomingReadResponses.lengthCompare(1) <= 0,
         s"AIE PLIO sharing group '$groupLabel': '${member.subPEName}.${member.portName}' has more than one PL-side read-response producer")
 
       val (logicalWidth, sourceKind, sourceSubPEName) =
-        if (isHardCilkInput) {
+        if (group.direction == "aieToPl") {
+          require(sharingMode == AiePlioSharingMode.Single,
+            s"AIE PLIO sharing group '$groupLabel': AIE-to-PL record outputs require mode 'single'")
+          require(group.physicalPlioWidth == 32,
+            s"AIE PLIO sharing group '$groupLabel': AIE-to-PL output PLIO width must be 32")
+          val rwWidth = rwOutput.map { req =>
+            val raw = if (req.`type` == "read" && req.mode == "single") 64
+              else if (req.`type` == "read") 96
+              else 64 + req.portWidth
+            ((raw + 63) / 64) * 64
+          }
+          val untaggedWidth = outputConnections.maxOption.orElse(generatedOutputWidth)
+            .orElse(rwWidth).orElse(if (packedOutput) Some(group.logicalWidth) else None)
+          val width = (if (taggedCreditOutput) untaggedWidth.map(_ + 128)
+            else untaggedWidth).get
+          require(width > 0 && width % 32 == 0,
+            s"AIE PLIO sharing group '$groupLabel': output width must be a positive multiple of 32")
+          require(!taggedCreditOutput || untaggedWidth.nonEmpty &&
+            width == untaggedWidth.get + 128,
+            s"AIE PLIO sharing group '$groupLabel': tagged output must use payload width plus 128 bits")
+          require(group.logicalWidth == 0 || group.logicalWidth == width,
+            s"AIE PLIO sharing group '$groupLabel': explicit logicalWidth ${group.logicalWidth} does not match generated width $width")
+          (width, if (packedOutput) AiePlioSourceKind.PackedOutput
+            else if (rwOutput.nonEmpty) AiePlioSourceKind.RwRequest
+            else AiePlioSourceKind.HardCilkOutput, member.subPEName)
+        } else if (isHardCilkInput) {
           if (member.portName == "taskIn") {
             val hasInternalPredecessor = subPEList.values.exists { candidate =>
               candidate.peName == task.name &&
@@ -520,11 +696,25 @@ case class FullSysGenDescriptor(
         fifoDepth = group.fifoDepth,
         logicalWidth = logicalWidth,
         sourceKind = sourceKind,
-        sourceSubPEName = sourceSubPEName
+        sourceSubPEName = sourceSubPEName,
+        creditCapacity = group.creditCapacity,
+        initialCredits = group.initialCredits,
+        creditReturnPort = group.creditReturnPort,
+        creditTiming = group.creditTiming,
+        aieFifoDepth = group.aieFifoDepth,
+        segmentBeats = group.segmentBeats,
+        lengthDriven = group.lengthDriven,
+        creditTag = groupIndex
       )
       physicalGroup.validate(this)
       physicalGroup
     }
+  }
+
+  private def nextPow2(value: Int): Int = {
+    var result = 1
+    while (result < value) result = result << 1
+    result
   }
 
   // --- All helper logic is kept here ---

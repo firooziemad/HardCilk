@@ -1,7 +1,10 @@
 package SoftwareUtil.aie
 
 import Descriptors._
+import aiehelpers.{V5CreditProtocol, StreamSplitterPlan}
 import java.io.PrintWriter
+import java.nio.file.{Files, Paths}
+import java.nio.charset.StandardCharsets
 import scala.collection.mutable
 
 // TODO: PLIO width is not properly handled
@@ -36,19 +39,20 @@ object ProjectHeaderTemplate {
       taskOutputPorts: Seq[String]
   )
 
-  private case class TaskOutputDef(
-      taskName: String,
-      peIndex: Int,
-      portType: String,
-      bitWidth: Int
-  )
-
   private case class StreamSplitterGroupDef(
       groupName: String,
       taskName: String,
       peIndex: Int,
+      unitName: String,
       outputPortTypes: Seq[String],
       outputWidths: Seq[Int]
+  )
+
+  private case class CreditBinding(
+      group: AIEPlioPhysicalSharingGroupDescriptor,
+      laneIndex: Int,
+      unitName: String,
+      aliasName: String
   )
 
   def generateProjectHeader(descriptor: FullSysGenDescriptor, projectFolder: String): Unit = {
@@ -56,17 +60,36 @@ object ProjectHeaderTemplate {
     val portBitWidthsByTaskPePort = buildHardCilkPortBitWidthsByTaskPePort(descriptor)
     val logicalPorts = buildPortDefs(descriptor, units, portBitWidthsByTaskPePort)
     val sharingGroups = descriptor.expandedAiePlioSharingGroups
+    require(!sys.env.contains("HC_EXP1_ROUTE_CASE") &&
+      !sys.env.get("HC_AIE_EXPLICIT_DMA").contains("1"),
+      "V6 slot-credit mode does not use legacy routing overrides")
+    val creditGroups = sharingGroups.filter(_.direction == "plToAie")
+    val creditBindings = buildCreditBindings(units, creditGroups)
+    generateManualCreditConfig(projectFolder, units, descriptor, creditBindings)
     val sharedMembers = sharingGroups.flatMap(_.members).toSet
-    val inputPortNames = logicalPorts.filter(_.direction == "input").map(_.varName).toSet
-    val missingMembers = sharedMembers -- inputPortNames
-    require(missingMembers.isEmpty,
-      s"AIE PLIO sharing members are not generated input PLIOs: ${missingMembers.toSeq.sorted.mkString(", ")}")
+    val portDirection = logicalPorts.map(p => p.varName -> p.direction).toMap
+    sharingGroups.foreach { group =>
+      val requiredDirection = if (group.direction == "plToAie") "input" else "output"
+      val invalid = group.members.filter(m => portDirection.get(m) != Some(requiredDirection))
+      require(invalid.isEmpty,
+        s"AIE PLIO sharing group '${group.name}' requires generated $requiredDirection PLIOs: ${invalid.mkString(", ")}")
+    }
+    val inputGroups = sharingGroups.filter(_.direction == "plToAie")
+    val outputGroups = sharingGroups.filter(_.direction == "aieToPl")
 
     val physicalPorts = sharingGroups.map { group =>
       PortDef(
         varName = group.effectivePhysicalPortName,
         plioName = s"PLIO_${group.effectivePhysicalPortName}",
-        direction = "input",
+        direction = if (group.direction == "plToAie") "input" else "output",
+        // Vitis 2022.2 can acknowledge a packet which starts and ends in one
+        // partially-filled wide PLIO beat without delivering its payload past
+        // the packet splitter. This is observable for a 64-bit fixed record:
+        // the PL emits header+payload as 96 valid bits on a 128-bit PLIO, the
+        // shim accepts TKEEP=0x0fff/TLAST, but the destination kernel remains
+        // blocked. A 32-bit packet PLIO gives the header and every payload
+        // word an unambiguous full-width beat. The PL-side packet mux may
+        // remain wider; v++ inserts the width converter at the PL/AIE boundary.
         bits = group.physicalPlioWidth
       )
     }
@@ -76,7 +99,8 @@ object ProjectHeaderTemplate {
     val lines =
       Seq(
         "#include <adf.h>",
-        "#include \"kernels.h\"",
+        "#include \"kernels.h\""
+      ) ++ Seq(
         "",
         "using namespace adf;",
         "",
@@ -86,13 +110,15 @@ object ProjectHeaderTemplate {
         buildKernelDeclarations(units) ++
         Seq("public:") ++
         buildPortDeclarations(ports) ++
-		buildPacketSplitterDeclarations(sharingGroups) ++
+		buildPacketSplitterDeclarations(inputGroups) ++
+        outputGroups.map(g => s"  pktmerge<${g.fanIn}> ${g.name}_merge;") ++
         Seq("  simpleGraph(){") ++
         Seq("    // PLIOs") ++
         buildPlioCreations(ports) ++
-		buildPacketSplitterCreates(sharingGroups) ++
+		buildPacketSplitterCreates(inputGroups) ++
+        outputGroups.map(g => s"    ${g.name}_merge = pktmerge<${g.fanIn}>::create();") ++
         Seq("", "    // Kernels") ++
-        buildKernelCreates(units) ++
+        buildKernelCreates(units, creditBindings) ++
         Seq("", "    // Connections") ++
         buildConnections(units, descriptor) ++
         Seq("  }", "};")
@@ -102,6 +128,20 @@ object ProjectHeaderTemplate {
       writer.write(lines.mkString("\n") + "\n")
     } finally {
       writer.close()
+    }
+    if (outputGroups.nonEmpty) {
+      val packetRoute = raw".*connect< pktstream > net[0-9]+ \(([A-Za-z0-9_]+)_kernel\.out\[([0-9]+)\], ([A-Za-z0-9_]+)_merge\.in\[([0-9]+)\]\);".r
+      val widths = outputGroups.map(g => g.name -> (g.logicalWidth / 32)).toMap
+      val functions = units.map(u => u.unitName -> u.functionName).toMap
+      val routes = lines.collect { case packetRoute(unit, port, group, _) =>
+        require(functions.contains(unit) && widths.contains(group),
+          s"Unknown direct packet route $unit -> $group")
+        s"$unit\t${functions(unit)}\t$port\t${widths(group)}"
+      }
+      require(routes.length == outputGroups.map(_.fanIn).sum,
+        s"Expected ${outputGroups.map(_.fanIn).sum} direct packet routes, found ${routes.length}")
+      Files.writeString(Paths.get(projectFolder, "direct_packet_outputs.tsv"),
+        routes.mkString("\n") + "\n", StandardCharsets.UTF_8)
     }
   }
 
@@ -402,17 +442,17 @@ object ProjectHeaderTemplate {
 
     units.foreach { unit =>
       val task = taskByName(unit.taskName)
-      val inputPorts = orderTaskInputPorts(unit.taskInputPorts) ++ unit.rwInputPorts.sorted
+      val inputPorts = uniquePreserveOrder(
+        orderTaskInputPorts(unit.taskInputPorts) ++ unit.rwInputPorts.sorted)
       val taskOutputPorts = orderTaskOutputPorts(unit.taskOutputPorts)
       val rwOutputPorts = unit.rwOutputPorts.sorted
-      val outputPorts = taskOutputPorts ++ rwOutputPorts
-      val groupedOutputPorts =
-        if (unit.nextChainUnitName.nonEmpty) outputPorts.filterNot(_ == "taskOutInternal")
-        else buildStreamSplitterGroups(descriptor)
-          .find(group => group.taskName == unit.taskName && group.peIndex == unit.peIndex)
-          .map(_.outputPortTypes.filter(outputPorts.contains))
-          .getOrElse(Seq.empty[String])
-      val groupedOutputSet = groupedOutputPorts.toSet
+      val outputPorts = uniquePreserveOrder(taskOutputPorts ++ rwOutputPorts)
+      val groupedOutputGroups = buildStreamSplitterGroups(descriptor)
+        .filter(group => group.taskName == unit.taskName && group.peIndex == unit.peIndex &&
+          group.unitName == unit.unitName)
+        .map(_.outputPortTypes.filter(outputPorts.contains))
+        .filter(_.nonEmpty)
+      val groupedOutputSet = groupedOutputGroups.flatten.toSet
 
       inputPorts.foreach { p =>
         val isInternalChainInput = p == "taskIn" && unit.prevChainUnitName.nonEmpty
@@ -453,7 +493,7 @@ object ProjectHeaderTemplate {
         }
       }
 
-      if (groupedOutputPorts.nonEmpty) {
+      groupedOutputGroups.foreach { groupedOutputPorts =>
         val varName = packedOutputVarName(unit, groupedOutputPorts)
         val packedBits = toSupportedPlioBits(groupedOutputPorts.map { port =>
           resolvePortWidthBits(
@@ -509,42 +549,52 @@ object ProjectHeaderTemplate {
   private def buildPacketSplitterCreates(groups: Seq[AIEPlioPhysicalSharingGroupDescriptor]): Seq[String] =
     groups.map(group => s"    ${group.name}_split = pktsplit<${group.fanIn}>::create();")
 
-  private def buildKernelCreates(units: Seq[UnitDef]): Seq[String] =
+  private def buildKernelCreates(
+      units: Seq[UnitDef], bindings: Seq[CreditBinding]): Seq[String] = {
+    val bindingByUnit = bindings.groupBy(_.unitName).view.mapValues(_.head).toMap
     units.flatMap { u =>
+      val functionName = u.functionName
       Seq(
-        s"    ${u.unitName}_kernel = kernel::create(${u.functionName});",
-        s"    source(${u.unitName}_kernel) = \"kernels/${u.functionName}.cc\";",
+        s"    ${u.unitName}_kernel = kernel::create($functionName);",
+        s"    source(${u.unitName}_kernel) = \"kernels/$functionName.cc\";",
         s"    runtime<ratio>(${u.unitName}_kernel) = 1;"
       )
     }
+  }
 
   private def buildConnections(units: Seq[UnitDef], descriptor: FullSysGenDescriptor): Seq[String] = {
     val lines = mutable.ArrayBuffer[String]()
     var net = 0
     val unitsByName = units.map(u => u.unitName -> u).toMap
-	val sharedMemberRoutes = descriptor.expandedAiePlioSharingGroups.flatMap { group =>
+	val sharedMemberRoutes = descriptor.expandedAiePlioSharingGroups.filter(_.direction == "plToAie").flatMap { group =>
 	  group.members.zipWithIndex.map { case (member, branchIndex) =>
 		member -> (group, branchIndex)
 	  }
 	}.toMap
 
-	descriptor.expandedAiePlioSharingGroups.zipWithIndex.foreach { case (group, groupIndex) =>
+	descriptor.expandedAiePlioSharingGroups.filter(_.direction == "plToAie").zipWithIndex.foreach { case (group, groupIndex) =>
 	  lines += s"    connect< pktstream > sharedPhysicalNet$groupIndex (${group.effectivePhysicalPortName}.out[0], ${group.name}_split.in[0]);"
 	}
 
+    val outputRoutes = descriptor.expandedAiePlioSharingGroups.filter(_.direction == "aieToPl")
+      .flatMap(g => g.members.zipWithIndex.map { case (member, index) => member -> (g, index) }).toMap
+    descriptor.expandedAiePlioSharingGroups.filter(_.direction == "aieToPl").zipWithIndex.foreach { case (group, index) =>
+      lines += s"    connect< pktstream > sharedOutputNet$index (${group.name}_merge.out[0], ${group.effectivePhysicalPortName}.in[0]);"
+    }
+
     units.foreach { u =>
-      val inputPorts = orderTaskInputPorts(u.taskInputPorts) ++ u.rwInputPorts.sorted
+      val inputPorts = uniquePreserveOrder(
+        orderTaskInputPorts(u.taskInputPorts) ++ u.rwInputPorts.sorted)
       val taskOutputPorts = orderTaskOutputPorts(u.taskOutputPorts)
       val rwOutputPorts = u.rwOutputPorts.sorted
-      val outputPorts = taskOutputPorts ++ rwOutputPorts
-      val groupedOutputPorts =
-        if (u.nextChainUnitName.nonEmpty) outputPorts.filterNot(_ == "taskOutInternal")
-        else buildStreamSplitterGroups(descriptor)
-          .find(group => group.taskName == u.taskName && group.peIndex == u.peIndex)
-          .map(_.outputPortTypes.filter(outputPorts.contains))
-          .getOrElse(Seq.empty[String])
-      val groupedOutputSet = groupedOutputPorts.toSet
-      val groupedOutputRepr = groupedOutputPorts.headOption
+      val outputPorts = uniquePreserveOrder(taskOutputPorts ++ rwOutputPorts)
+      val groupedOutputGroups = buildStreamSplitterGroups(descriptor)
+        .filter(group => group.taskName == u.taskName && group.peIndex == u.peIndex &&
+          group.unitName == u.unitName)
+        .map(_.outputPortTypes.filter(outputPorts.contains))
+        .filter(_.nonEmpty)
+      val groupedOutputSet = groupedOutputGroups.flatten.toSet
+      val groupedOutputByPort = groupedOutputGroups.flatMap(group => group.map(_ -> group)).toMap
 
       // Build consolidated output list treating groups as single entries
       val consolidatedOutputs = mutable.ArrayBuffer[String]()
@@ -559,11 +609,12 @@ object ProjectHeaderTemplate {
           consolidatedIdx += 1
         } else {
           // In a per-unit group, map all grouped ports to the same consolidated index.
-          val groupRepr = groupedOutputRepr.get
+          val group = groupedOutputByPort(port)
+          val groupRepr = group.head
           if (!portToConsolidatedIndex.contains(groupRepr)) {
             consolidatedOutputs += groupRepr
             portToConsolidatedIndex(groupRepr) = consolidatedIdx
-            groupedOutputPorts.foreach { p =>
+            group.foreach { p =>
               portToConsolidatedIndex(p) = consolidatedIdx
             }
             consolidatedIdx += 1
@@ -574,7 +625,8 @@ object ProjectHeaderTemplate {
       inputPorts.zipWithIndex.foreach { case (port, inIdx) =>
         if (port == "taskIn" && u.prevChainUnitName.nonEmpty) {
           val prevUnit = unitsByName(u.prevChainUnitName.get)
-          val prevOutputPorts = orderTaskOutputPorts(prevUnit.taskOutputPorts) ++ prevUnit.rwOutputPorts.sorted
+          val prevOutputPorts = uniquePreserveOrder(
+            orderTaskOutputPorts(prevUnit.taskOutputPorts) ++ prevUnit.rwOutputPorts.sorted)
           val prevTaskOutIdx = {
             val internalIdx = prevOutputPorts.indexOf("taskOutInternal")
             if (internalIdx >= 0) internalIdx else prevOutputPorts.indexOf("taskOut")
@@ -585,12 +637,17 @@ object ProjectHeaderTemplate {
           }
         } else {
           val plioVar = s"${u.unitName}_$port"
-		  sharedMemberRoutes.get(plioVar) match {
-			case Some((group, branchIndex)) =>
-			  lines += s"    connect< pktstream, stream > net$net (${group.name}_split.out[$branchIndex], ${u.unitName}_kernel.in[$inIdx]);"
-			case None =>
-			  lines += s"    connect< stream > net$net (${plioVar}.out[0], ${u.unitName}_kernel.in[$inIdx]);"
-		  }
+          sharedMemberRoutes.get(plioVar) match {
+            case Some((group, branchIndex)) =>
+              lines += s"    connect< pktstream, stream > net$net (${group.name}_split.out[$branchIndex], ${u.unitName}_kernel.in[$inIdx]);"
+              // Equal depth requests on packet-split branches can be merged by
+              // aiecompiler. Distinct depths keep each receive slot on its
+              // own FIFO; the routed-FIFO gate verifies the actual resources.
+              lines += s"    fifo_depth(net$net) = ${group.receiveFifoDepths(branchIndex)};"
+              lines += s"    location<fifo>(net$net) = {ss_fifo()};"
+            case None =>
+              lines += s"    connect< stream > net$net (${plioVar}.out[0], ${u.unitName}_kernel.in[$inIdx]);"
+          }
           net += 1
         }
       }
@@ -601,16 +658,23 @@ object ProjectHeaderTemplate {
         if (!isInternalChainOutput && !isGroupedOutput) {
           val plioVar = s"${u.unitName}_$port"
           val consolidatedIdx = portToConsolidatedIndex(port)
-          lines += s"    connect< stream > net$net (${u.unitName}_kernel.out[$consolidatedIdx], ${plioVar}.in[0]);"
+          val route = outputRoutes.get(plioVar)
+          val dest = route.map { case (group, branch) => s"${group.name}_merge.in[$branch]" }.getOrElse(s"${plioVar}.in[0]")
+          val kind = if (route.nonEmpty) "pktstream" else "stream"
+          lines += s"    connect< $kind > net$net (${u.unitName}_kernel.out[$consolidatedIdx], $dest);"
           net += 1
         }
       }
 
       // Handle per-unit grouped PLIO output.
-      groupedOutputRepr.foreach { groupRepr =>
+      groupedOutputGroups.foreach { groupedOutputPorts =>
+        val groupRepr = groupedOutputPorts.head
         val packedVarName = packedOutputVarName(u, groupedOutputPorts)
         portToConsolidatedIndex.get(groupRepr).foreach { consolidatedIdx =>
-          lines += s"    connect< stream > net$net (${u.unitName}_kernel.out[$consolidatedIdx], ${packedVarName}.in[0]);"
+          val route = outputRoutes.get(packedVarName)
+          val dest = route.map { case (group, branch) => s"${group.name}_merge.in[$branch]" }.getOrElse(s"${packedVarName}.in[0]")
+          val kind = if (route.nonEmpty) "pktstream" else "stream"
+          lines += s"    connect< $kind > net$net (${u.unitName}_kernel.out[$consolidatedIdx], $dest);"
           net += 1
         }
       }
@@ -656,74 +720,15 @@ object ProjectHeaderTemplate {
     s"${unit.unitName}_${groupedOutputPorts.mkString("_")}"
 
   private def buildStreamSplitterGroups(descriptor: FullSysGenDescriptor): Seq[StreamSplitterGroupDef] = {
-    val outputsByTaskPe = collectTaskOutputs(descriptor).groupBy(out => (out.taskName, out.peIndex))
-
-    outputsByTaskPe
-      .toSeq
-      .sortBy { case ((taskName, peIndex), _) => (taskName, peIndex) }
-      .flatMap { case ((taskName, peIndex), outputs) =>
-        val ordered = outputs
-          .groupBy(_.portType)
-          .map(_._2.head)
-          .toSeq
-          .sortBy(out => (outputPortPriority(out.portType), out.portType))
-
-        if (ordered.size <= 2) {
-          Seq.empty
-        } else {
-          ordered.grouped(2).collect { case group if group.size > 1 =>
-            val widths = group.map(_.bitWidth)
-            StreamSplitterGroupDef(
-              groupName = s"StreamSplitter_${widths.mkString("_")}",
-              taskName = taskName,
-              peIndex = peIndex,
-              outputPortTypes = group.map(_.portType),
-              outputWidths = widths
-            )
-          }.toSeq
-        }
-      }
-  }
-
-  private def collectTaskOutputs(descriptor: FullSysGenDescriptor): Seq[TaskOutputDef] = {
-    val directOutputs = descriptor.getSystemConnectionsDescriptor().connections.flatMap { connection =>
-      val src = connection.srcPort
-      val dst = connection.dstPort
-      if (src.parentType == "PE" && dst.parentType == "HardCilk") {
-        Some(TaskOutputDef(src.parentName, src.parentIndex, src.portType, connection.bitWidth))
-      } else {
-        None
-      }
-    }
-
-    val writeBufferOutputs = descriptor.taskDescriptors.flatMap { task =>
-      val spawnNextWidth = getSpawnNextBundleWidthBits(descriptor, task)
-      val argDataOutWidth = getArgDataOutBundleWidthBits(descriptor, task)
-      (0 until task.numProcessingElements).flatMap { peIndex =>
-        val argDataOut =
-          if (task.generateArgOutWriteBuffer) Some(TaskOutputDef(task.name, peIndex, "argDataOut", argDataOutWidth)) else None
-        val spawnNext =
-          if (task.generateSpawnNextWriteBuffer) Some(TaskOutputDef(task.name, peIndex, "spawnNext", spawnNextWidth)) else None
-        Seq(argDataOut, spawnNext).flatten
-      }
-    }
-
-    (directOutputs ++ writeBufferOutputs)
-      .groupBy(out => (out.taskName, out.peIndex, out.portType))
-      .map(_._2.head)
-      .toSeq
-  }
-
-  private def outputPortPriority(portType: String): Int = {
-    portType match {
-      case "taskOut" => 0
-      case "taskOutGlobal" => 1
-      case "argOut" => 2
-      case "closureOut" => 3
-      case "mallocOut" => 4
-      case "argDataOut" => 5
-      case "spawnNext" => 6
-      case _ => 100
+    StreamSplitterPlan.groups(descriptor).map { group =>
+      val task = descriptor.taskDescriptors.find(_.name == group.taskName).get
+      StreamSplitterGroupDef(
+        groupName = s"StreamSplitter_${group.outputWidths.mkString("_")}",
+        taskName = group.taskName,
+        peIndex = group.peIndex,
+        unitName = group.endpointName + suffixForPe(group.peIndex, task.numProcessingElements),
+        outputPortTypes = group.dataRoutes.map(_.portType),
+        outputWidths = group.dataRoutes.map(_.bitWidth))
     }
   }
 
@@ -825,5 +830,102 @@ object ProjectHeaderTemplate {
   private def extractWidthOrDefault(portName: String, default: Int): Int = {
     val digits = """(\d+)""".r.findAllIn(portName).toList
     digits.lastOption.map(_.toInt).getOrElse(default)
+  }
+  private def buildCreditBindings(
+      units: Seq[UnitDef],
+      groups: Seq[AIEPlioPhysicalSharingGroupDescriptor]
+  ): Seq[CreditBinding] = {
+    val bindings = groups.flatMap { group =>
+      group.members.zipWithIndex.map { case (member, laneIndex) =>
+        val matches = units.filter(unit => member == s"${unit.unitName}_${group.portName}")
+        require(matches.size == 1,
+          s"V6 credit group '${group.name}' member '$member' resolves to ${matches.size} AIE kernels")
+        val unit = matches.head
+        require(unit.taskOutputPorts.contains(group.creditReturnPort) ||
+          unit.rwOutputPorts.contains(group.creditReturnPort),
+          s"V6 credit group '${group.name}' requires output '${group.creditReturnPort}', but '${unit.functionName}' does not export it")
+        CreditBinding(group, laneIndex, unit.unitName, s"v6slot_credit_${unit.unitName}")
+      }
+    }
+    bindings.groupBy(_.unitName).foreach { case (unitName, perUnit) =>
+      val ports = perUnit.map(_.group.portName)
+      require(ports.distinct.size == ports.size,
+        s"V6 AIE kernel '$unitName' has duplicate credit bindings for ${ports.diff(ports.distinct).distinct.mkString(", ")}")
+    }
+    bindings
+  }
+
+  private def groupedKernelOutputGroups(
+      unit: UnitDef,
+      descriptor: FullSysGenDescriptor
+  ): Seq[Seq[String]] = {
+    val outputPorts = uniquePreserveOrder(
+      orderTaskOutputPorts(unit.taskOutputPorts) ++ unit.rwOutputPorts.sorted)
+    buildStreamSplitterGroups(descriptor)
+      .filter(group => group.taskName == unit.taskName &&
+        group.peIndex == unit.peIndex && group.unitName == unit.unitName)
+      .map(_.outputPortTypes.filter(outputPorts.contains))
+      .filter(_.nonEmpty)
+  }
+
+  private def kernelOutputCount(
+      unit: UnitDef,
+      descriptor: FullSysGenDescriptor
+  ): Int = {
+    val outputPorts = uniquePreserveOrder(
+      orderTaskOutputPorts(unit.taskOutputPorts) ++ unit.rwOutputPorts.sorted)
+    val groups = groupedKernelOutputGroups(unit, descriptor)
+    val grouped = groups.flatten.toSet
+    outputPorts.count(port => !grouped.contains(port)) + groups.size
+  }
+
+  private def kernelInputCount(unit: UnitDef): Int =
+    uniquePreserveOrder(
+      orderTaskInputPorts(unit.taskInputPorts) ++ unit.rwInputPorts.sorted).size
+
+  private def generateManualCreditConfig(
+      projectFolder: String, units: Seq[UnitDef],
+      descriptor: FullSysGenDescriptor, bindings: Seq[CreditBinding]
+  ): Unit = {
+    val byName = units.map(u => u.unitName -> u).toMap
+    val kernels = units.map { unit =>
+      val name = unit.unitName
+      val ports = bindings.filter(_.unitName == name)
+      val inputPorts = uniquePreserveOrder(orderTaskInputPorts(unit.taskInputPorts) ++ unit.rwInputPorts.sorted)
+      val outputPorts = uniquePreserveOrder(orderTaskOutputPorts(unit.taskOutputPorts) ++ unit.rwOutputPorts.sorted)
+      val groups = groupedKernelOutputGroups(unit, descriptor)
+      val representative = outputPorts.map(p => p -> groups.find(_.contains(p)).map(_.head).getOrElse(p)).toMap
+      val outputs = uniquePreserveOrder(outputPorts.map(representative))
+      val receives = ports.sortBy(_.group.portName).map { binding =>
+        val group = binding.group
+        val split = StreamSplitterPlan.groups(descriptor).find(g =>
+          g.taskName == unit.taskName && g.peIndex == unit.peIndex &&
+          g.endpointName == unit.functionName && g.creditGroups.exists(_.name == group.name))
+        val task = descriptor.taskDescriptors.find(_.name == unit.taskName).get
+        val words = split.map(g => (g.outputWidths.max + 31) / 32 + 4).getOrElse {
+          val bits = resolvePortWidthBits(task, unit.peIndex, group.creditReturnPort,
+            false, buildHardCilkPortBitWidthsByTaskPePort(descriptor))
+          require(bits >= 64 && bits % 32 == 0, "V6 slot credit return needs a whole >=64-bit record")
+          bits / 32
+        }
+        val tag = split.map(g => g.dataRoutes.size + g.creditGroups.indexWhere(_.name == group.name))
+          .getOrElse(group.creditTag)
+        V9CreditConfig.Receive(inputPorts.indexOf(group.portName),
+          outputs.indexOf(representative(group.creditReturnPort)),
+          group.logicalWidth / 32 * (if (group.mode == AiePlioSharingMode.Stream) group.segmentBeats else 1),
+          words, tag, split.nonEmpty, group.mode == AiePlioSharingMode.Stream)
+      }
+      val encodes = StreamSplitterPlan.groups(descriptor).filter(g =>
+        g.taskName == unit.taskName && g.peIndex == unit.peIndex &&
+          g.endpointName == unit.functionName && g.dataRoutes.size == 1 && g.creditGroups.nonEmpty
+      ).map { g =>
+        val route = g.dataRoutes.head
+        require(route.bitWidth % 32 == 0)
+        V9CreditConfig.Encode(outputs.indexOf(representative(route.portType)), route.bitWidth / 32)
+      }
+      V9CreditConfig.Kernel(unit.unitName, unit.functionName,
+        inputPorts, outputs, receives, encodes)
+    }
+    V9CreditConfig.write(projectFolder, kernels)
   }
 }

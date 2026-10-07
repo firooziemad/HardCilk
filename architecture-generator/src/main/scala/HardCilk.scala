@@ -115,6 +115,7 @@ class HardCilk(
 
   // This call now invokes the method from the HasHBMInterconnect trait
   buildAndConnectHBM(peMap, schedulerMap, allocatorMap, notifierMap, memAllocatorMap, spawnNextWBMap, sendArgumentWBMap, remoteStreamToMemMap)
+  validateSplitAieOutputs()
 
   exportPEControl(peMap)
   generateHdlInfo()
@@ -154,15 +155,22 @@ class HardCilk(
       */
 
       val ioName = f"BindTo_PE_${pePortDesc.parentName}_${pePortDesc.parentIndex}_${pePortDesc.portType}"
-      val consumedByPacketizer = attachAieSharedTaskInput(
-        pePortDesc.parentName,
-        pePortDesc.parentIndex,
-        pePortDesc.portType,
-        subsystemPort
-      )
+      val consumedByPacketizer = if (port.isSource) attachAieSharedTaskInput(
+        pePortDesc.parentName, pePortDesc.parentIndex, pePortDesc.portType, subsystemPort
+      ) else false
+      val producedByDemux = if (!port.isSource) attachAieSharedTaskOutput(
+        pePortDesc.parentName, pePortDesc.parentIndex, pePortDesc.portType, subsystemPort
+      ) else false
+      val producedBySplitter = if (!port.isSource && !producedByDemux) attachSplitAieOutput(
+        pePortDesc.parentName, pePortDesc.parentIndex, pePortDesc.portType, subsystemPort
+      ) else false
 
       if (consumedByPacketizer) {
         println(s"  ... integrating ${ioName} into an AIE packet mux")
+      } else if (producedByDemux) {
+        println(s"  ... integrating ${ioName} into an AIE packet demux")
+      } else if (producedBySplitter) {
+        println(s"  ... integrating ${ioName} into an AIE output splitter/credit decoder")
       } else {
         val newIO = IO(chiselTypeOf(subsystemPort))
         newIO.suggestName(ioName)

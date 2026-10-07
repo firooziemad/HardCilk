@@ -72,7 +72,10 @@ object DescriptorJSON {
   implicit val aiePlioSharingGroupDescriptorDecoder: Decoder[AIEPlioSharingGroupDescriptor] =
     rejectUnknownFields(
       "AIE PLIO sharing group",
-      Set("direction", "mode", "members", "physicalPlioWidth", "fifoDepth"),
+      Set("direction", "mode", "members", "physicalPlioWidth", "fifoDepth",
+        "creditCapacity", "initialCredits", "creditReturnPort",
+        "creditTiming", "aieFifoDepth",
+        "segmentBeats", "lengthDriven", "logicalWidth"),
       aiePlioSharingGroupDescriptorBaseDecoder
     )
   implicit val aiePlioSharingGroupDescriptorEncoder: Encoder[AIEPlioSharingGroupDescriptor] = deriveConfiguredEncoder[AIEPlioSharingGroupDescriptor]

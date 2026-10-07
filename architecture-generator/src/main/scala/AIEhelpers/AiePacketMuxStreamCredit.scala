@@ -2,11 +2,9 @@ package aiehelpers
 
 import chisel3._
 import chisel3.experimental.prefix
-import chisel3.util.{Fill, PopCount, isPow2, log2Ceil}
-
+import chisel3.util.{Fill, PopCount, isPow2, log2Ceil, Queue}
 import chext.{elasticnew => e}
 import e.ConnectOp._
-
 import chext.amba.axi4s
 import axi4s.Casts._
 
@@ -22,12 +20,20 @@ case class AiePacketMuxStream_Config(
     packetIds: Vector[Int],
     dataWidth: Int,
     fifoDepth: Int = 2,
-    outputWidth: Int = 32
+    outputWidth: Int,
+    segmentBeats: Int,
+    creditCapacities: Vector[Int],
+    initialCredits: Vector[Int],
+    creditPerSegment: Boolean = true
 ) {
   val fanIn: Int = packetIds.length
 
   require(fanIn >= 2 && fanIn <= 32,
     "AiePacketMuxStream fan-in must be between 2 and 32")
+  require(Set(2, 4).contains(fanIn),
+    "V9 verified receive-FIFO mode supports only fan-in 2 or 4")
+  require(creditCapacities.length == fanIn && initialCredits.length == fanIn,
+    "Every packet-mux lane requires a capacity and initial credit count")
   require(packetIds.distinct.length == fanIn, "Packet IDs must be unique")
   require(packetIds.forall(id => id >= 0 && id < 32),
     "Every packet ID must be between 0 and 31")
@@ -39,34 +45,128 @@ case class AiePacketMuxStream_Config(
 
   val selectWidth: Int = log2Ceil(fanIn)
   val inputCfg: axi4s.Config = axi4s.Config(wData = dataWidth)
-  val packetCfg: axi4s.Config = axi4s.Config(wData = outputWidth)
+  val outputCfg: axi4s.Config = axi4s.Config(wData = outputWidth)
 
   def moduleSuffix: String =
     if (outputWidth == 32) s"${fanIn}_${dataWidth}"
     else s"${fanIn}_${dataWidth}_${outputWidth}"
 }
 
-private class AiePacketMuxStream_PacketBeat(packetCfg: axi4s.Config)
+/**
+  * Counted stream admission. A receive-slot credit admits one bounded transport
+  * segment. A request-derived token admits one complete logical read response,
+  * even when it spans several bounded transport segments.
+  */
+class AiePacketMuxStreamCredit_Basic(
+    cfg: AiePacketMuxStream_Config
+) extends Module {
+  import cfg._
+
+  require(segmentBeats > 0, "V5 stream credit mux requires positive segmentBeats")
+
+  override def desiredName: String =
+    s"AiePacketMuxStreamCredit_Basic_${cfg.moduleSuffix}_s${segmentBeats}_c${creditCapacities.mkString("_")}_i${initialCredits.mkString("_")}"
+
+  val packetIn = IO(Vec(fanIn, axi4s.Slave(inputCfg)))
+  val packetOut = IO(axi4s.Master(outputCfg))
+  val creditReturn = IO(Input(Vec(fanIn, Bool())))
+
+  private val innerInputs = Wire(Vec(fanIn, axi4s.Master(inputCfg)))
+  private val counters = Module(new V5CreditCounter(
+    creditCapacities, initialCredits))
+  counters.replenish := creditReturn
+  private val segmentActive = RegInit(VecInit(Seq.fill(fanIn)(false.B)))
+  // A read request grants one complete logical response. That response may be
+  // divided into several bounded transport packets, but consumes its grant
+  // only once. Ordinary AIE receive-slot credits remain segment based.
+  private val logicalStreamActive = RegInit(VecInit(Seq.fill(fanIn)(false.B)))
+  private val beatWidth = math.max(1, chisel3.util.log2Ceil(math.max(2, segmentBeats)))
+  private val beatIndex = RegInit(VecInit(Seq.fill(fanIn)(0.U(beatWidth.W))))
+
+  for (lane <- 0 until fanIn) {
+    val source = packetIn(lane).asFull
+    val sink = innerInputs(lane).asFull
+    val creditUnitActive =
+      if (creditPerSegment) segmentActive(lane) else logicalStreamActive(lane)
+    val mayEnter = creditUnitActive || counters.available(lane)
+    val reachesBound = beatIndex(lane) === (segmentBeats - 1).U
+    val physicalLast = source.bits.last.asBool || reachesBound
+
+    new e.Stall(source, sink) {
+      out := in
+      out.last := physicalLast
+      cond { !mayEnter }
+    }
+
+    val accepted = source.valid && source.ready
+    val startsCreditUnit = accepted && !creditUnitActive
+    val endsSegment = accepted && physicalLast
+
+    counters.consume(lane) := startsCreditUnit
+    when(accepted) {
+      logicalStreamActive(lane) := !source.bits.last.asBool
+      when(endsSegment) {
+        segmentActive(lane) := false.B
+        beatIndex(lane) := 0.U
+      }.otherwise {
+        segmentActive(lane) := true.B
+        beatIndex(lane) := beatIndex(lane) + 1.U
+      }
+    }
+  }
+
+  private val inner = Module(new V5PacketizedStreamMuxCore(cfg))
+  for (lane <- 0 until fanIn) {
+    inner.packetIn(lane) <> innerInputs(lane)
+  }
+  packetOut <> inner.packetOut
+
+  val creditAvailable = WireInit(counters.available.asUInt)
+    .suggestName("creditAvailable")
+  val creditCount = WireInit(counters.count.asUInt)
+    .suggestName("creditCount")
+  val admittedSegment = WireInit(segmentActive.asUInt)
+    .suggestName("admittedSegment")
+  val admittedLogicalStream = WireInit(logicalStreamActive.asUInt)
+    .suggestName("admittedLogicalStream")
+  val creditReturnMask = WireInit(creditReturn.asUInt)
+    .suggestName("creditReturnMask")
+}
+
+// The stream implementation owns its packetizer, just as ReadStream owns its inner module.
+private class V5PacketMuxStreamPacketBeat(outputCfg: axi4s.Config)
     extends Bundle {
-  val channel = new axi4s.FullChannel(packetCfg)
+  val channel = new axi4s.FullChannel(outputCfg)
   val isHeader = Bool()
 }
 
 
-class AiePacketMuxStream_Basic(cfg: AiePacketMuxStream_Config) extends Module {
+private[aiehelpers] class V5PacketizedStreamMuxCore(cfg: AiePacketMuxStream_Config) extends Module {
   import cfg._
 
   override def desiredName: String =
-    s"AiePacketMuxStream_Basic_${cfg.moduleSuffix}"
+    s"V5PacketizedStreamMuxCore_${cfg.moduleSuffix}"
 
   val packetIn = IO(Vec(fanIn, axi4s.Slave(inputCfg)))
-  val packetOut = IO(axi4s.Master(packetCfg))
+  val packetOut = IO(axi4s.Master(outputCfg))
 
   private val inputsAndRequests = packetIn.zipWithIndex.map {
     case (input, lane) =>
       prefix(s"packetize$lane") {
-        val source = e.SourceBuffer(input.asFull, count = fifoDepth)
-        val packetBeat = e.EWire(new AiePacketMuxStream_PacketBeat(packetCfg))
+        // Store-and-forward: never lock the shared mux onto an incomplete segment.
+        val segment = Module(new Queue(new axi4s.FullChannel(inputCfg), segmentBeats))
+        val complete = RegInit(false.B)
+        val ingress = input.asFull
+        segment.io.enq.bits := ingress.bits
+        segment.io.enq.valid := ingress.valid && !complete && !reset.asBool
+        ingress.ready := segment.io.enq.ready && !complete && !reset.asBool
+        val source = e.EWire(new axi4s.FullChannel(inputCfg))
+        source.bits := segment.io.deq.bits
+        source.valid := segment.io.deq.valid && complete && !reset.asBool
+        segment.io.deq.ready := source.ready && complete && !reset.asBool
+        when(segment.io.enq.fire && segment.io.enq.bits.last.asBool) { complete := true.B }
+        when(segment.io.deq.fire && segment.io.deq.bits.last.asBool) { complete := false.B }
+        val packetBeat = e.EWire(new V5PacketMuxStreamPacketBeat(outputCfg))
 
         /*
          * Header-aware width transducer.
@@ -205,7 +305,7 @@ class AiePacketMuxStream_Basic(cfg: AiePacketMuxStream_Config) extends Module {
           }
         }
 
-        val muxInput = e.EWire(new axi4s.FullChannel(packetCfg))
+        val muxInput = e.EWire(new axi4s.FullChannel(outputCfg))
         val requestCandidate = e.EWire(Bool())
 
         new e.Fork(packetBeat) {
@@ -226,8 +326,8 @@ class AiePacketMuxStream_Basic(cfg: AiePacketMuxStream_Config) extends Module {
   private val muxInputs = inputsAndRequests.map(_._1)
   private val requests = inputsAndRequests.map(_._2)
 
-  // Preserve the original four-lane order (3, 0, 1, 2), generalized to N.
-  private val arbitrationOrder = Seq(fanIn - 1) ++ (0 until fanIn - 1)
+  // Use natural lane order.
+  private val arbitrationOrder = 0 until fanIn
   private val selectCandidate = e.EWire(UInt(selectWidth.W))
 
   e.Arbiter(
@@ -249,25 +349,3 @@ class AiePacketMuxStream_Basic(cfg: AiePacketMuxStream_Config) extends Module {
     isLastFn = ((in: axi4s.FullChannel) => in.last.asBool)
   )
 }
-
-// object AiePacketMuxStreamEmit extends App {
-//   require(
-//     args.length >= 3,
-//     "Usage: AiePacketMuxStreamEmit ID0,ID1,... DATA_WIDTH OUTPUT_WIDTH [firtool options]"
-//   )
-
-//   val packetIds = args(0).split(',').map(Integer.decode(_).intValue()).toVector
-//   val dataWidth = args(1).toInt
-//   val outputWidth = args(2).toInt
-
-//   _root_.circt.stage.ChiselStage.emitSystemVerilogFile(
-//     new AiePacketMuxStream_Basic(
-//       AiePacketMuxStream_Config(
-//         packetIds = packetIds,
-//         dataWidth = dataWidth,
-//         outputWidth = outputWidth
-//       )
-//     ),
-//     args.drop(3)
-//   )
-// }

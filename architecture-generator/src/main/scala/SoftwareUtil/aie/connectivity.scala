@@ -2,6 +2,7 @@ package SoftwareUtil.aie
 import Descriptors._
 import java.io.PrintWriter
 import scala.collection.mutable
+import aiehelpers.StreamSplitterPlan
 
 object ConnectivityTemplate {
 	private case class HelperKernelDef(
@@ -30,8 +31,10 @@ object ConnectivityTemplate {
 			peIndex: Int,
 			aieEndpointName: String,
 			aiePortType: String,
-			outputPortTypes: Seq[String],
-			outputWidths: Seq[Int]
+				outputPortTypes: Seq[String],
+				outputWidths: Seq[Int],
+				creditGroups: Seq[AIEPlioPhysicalSharingGroupDescriptor],
+				physicalPortName: String
 	)
 
 	private case class OutputRouteDef(
@@ -134,17 +137,7 @@ object ConnectivityTemplate {
 	): Seq[String] = {
 		val nkHardCilk = Seq(s"nk=$hardCilkKernelName:1:$hardCilkInstance")
 
-		val nkSplitters = streamSplitters
-			.groupBy(_.kernelName)
-			.map { case (kernelName, instances) =>
-				val count = instances.length
-				val instanceNames = instances.map(_.instanceName).mkString(",")
-				s"nk=$kernelName:$count:$instanceNames"
-			}
-			.toSeq
-			.sorted
-
-		nkHardCilk ++ nkSplitters
+		nkHardCilk
 	}
 
 	private def buildSpLines(
@@ -288,11 +281,14 @@ object ConnectivityTemplate {
 			}
 
 		val outputConnections = buildTaskOutputConnections(descriptor, hardCilkInstance, aieEndpointByTask, streamSplitters, helperKernels)
-		val sharedInputConnections = descriptor.expandedAiePlioSharingGroups.map { group =>
+		val sharedInputConnections = descriptor.expandedAiePlioSharingGroups.filter(_.direction == "plToAie").map { group =>
 			s"sc=$hardCilkInstance.${group.effectivePhysicalPortName}:ai_engine_0.PLIO_${group.effectivePhysicalPortName}"
 		}
 
-		(directInputConnections ++ sharedInputConnections ++ outputConnections)
+		(directInputConnections ++ sharedInputConnections ++
+          descriptor.expandedAiePlioSharingGroups.filter(_.direction == "aieToPl").map { group =>
+            s"sc=ai_engine_0.PLIO_${group.effectivePhysicalPortName}:$hardCilkInstance.${group.effectivePhysicalPortName}"
+          } ++ outputConnections)
 			.distinct
 			.sorted
 	}
@@ -324,28 +320,39 @@ object ConnectivityTemplate {
 			s.outputPortTypes.map(port => (s.taskName, s.peIndex, s.aieEndpointName, port) -> s)
 		}.toMap
 
-		val routedConnections = allRoutes.map { route =>
+		val sharedOutputs = descriptor.expandedAiePlioSharingGroups.filter(_.direction == "aieToPl")
+          .flatMap(g => g.peIndices.map(i => (g.taskName, i, g.portName))).toSet
+
+        val routedConnections = allRoutes.filterNot(r =>
+          sharedOutputs.contains((r.taskName, r.peIndex, r.portType))).flatMap { route =>
 			val task = descriptor.taskDescriptors.find(_.name == route.taskName)
 			val peCount = task.map(_.numProcessingElements).getOrElse(1)
 			val peSuffix = suffixForPe(route.peIndex, peCount)
 			val aiePort = s"ai_engine_0.PLIO_${route.aieEndpointName}${peSuffix}_${route.portType}"
 
 			splitterByTaskPePort.get((route.taskName, route.peIndex, route.aieEndpointName, route.portType)) match {
-				case Some(splitter) =>
-					val outputIdx = splitter.outputPortTypes.indexOf(route.portType)
-					s"sc=${splitter.instanceName}.outputs_$outputIdx:${route.sink}"
+				case Some(_) => Seq.empty
 				case None =>
-					s"sc=$aiePort:${route.sink}"
+					Seq(s"sc=$aiePort:${route.sink}")
 			}
- 		}
+		}
 
-		routedConnections ++ streamSplitters.map { splitter =>
+		val physicalConnections = streamSplitters.map { splitter =>
 			val task = descriptor.taskDescriptors.find(_.name == splitter.taskName)
 			val peCount = task.map(_.numProcessingElements).getOrElse(1)
 			val peSuffix = suffixForPe(splitter.peIndex, peCount)
 			val aiePort = s"ai_engine_0.PLIO_${splitter.aieEndpointName}${peSuffix}_${splitter.aiePortType}"
-			s"sc=$aiePort:${splitter.instanceName}.input"
+			val packedGroup = descriptor.expandedAiePlioSharingGroups.find { group =>
+              group.sourceKind == AiePlioSourceKind.PackedOutput &&
+              group.taskName == splitter.taskName && group.portName == splitter.aiePortType &&
+              group.subPEName.toLowerCase.replaceAll("[^a-z0-9_]", "") == splitter.aieEndpointName &&
+              group.peIndices.contains(splitter.peIndex)
+            }
+            val source = packedGroup.map(g =>
+              s"$hardCilkInstance.${g.name}_packed_${splitter.peIndex}").getOrElse(aiePort)
+            if (packedGroup.nonEmpty) "" else if (packedGroup.nonEmpty) "" else s"sc=$source:$hardCilkInstance.${splitter.physicalPortName}"
 		}
+		routedConnections ++ physicalConnections.filter(_.nonEmpty)
 	}
 
 	private def buildStreamSplitterDefs(
@@ -353,59 +360,20 @@ object ConnectivityTemplate {
 			aieEndpointByTask: Map[String, TaskAieEndpointDef],
 			helperKernels: List[HelperKernelDef]
 	): Seq[StreamSplitterDef] = {
-		val nonLastEndpointsByTask = getNonLastEndpointsByTask(descriptor)
-
-		val hardCilkOutputRoutes = collectTaskOutputs(descriptor).map { out =>
-			val taskEndpoints = aieEndpointByTask.getOrElse(out.taskName, TaskAieEndpointDef(out.taskName, out.taskName, Map.empty, Map.empty))
-			OutputRouteDef(
-				taskName = out.taskName,
-				peIndex = out.peIndex,
-				aieEndpointName = resolveOutputEndpoint(taskEndpoints, out.portType),
-				portType = out.portType,
-				bitWidth = out.bitWidth,
-				sink = ""
+		return StreamSplitterPlan.groups(descriptor).zipWithIndex.map { case (group, index) =>
+			StreamSplitterDef(
+				kernelName = s"StreamSplitter_${group.outputWidths.mkString("_")}",
+				instanceName = s"internal_${index}",
+				taskName = group.taskName,
+				peIndex = group.peIndex,
+				aieEndpointName = group.endpointName,
+				aiePortType = group.aiePortType,
+				outputPortTypes = group.dataRoutes.map(_.portType),
+				outputWidths = group.outputWidths,
+				creditGroups = group.creditGroups,
+				physicalPortName = group.physicalPortName
 			)
 		}
-		val rwOutputRoutes = collectRWOutputRoutes(helperKernels).map(_.copy(sink = ""))
-		val outputsByTaskPeEndpoint = (hardCilkOutputRoutes ++ rwOutputRoutes)
-			.groupBy(out => (out.taskName, out.peIndex, out.aieEndpointName))
-
-		val instanceCounterByKernel = mutable.Map[String, Int]().withDefaultValue(0)
-
-		outputsByTaskPeEndpoint
-			.toSeq
-			.sortBy { case ((taskName, peIndex, endpointName), _) => (taskName, peIndex, endpointName) }
-			.flatMap { case ((taskName, peIndex, endpointName), outputs) =>
-				val isNonLastEndpoint = nonLastEndpointsByTask.getOrElse(taskName, Set.empty).contains(endpointName)
-				val ordered = outputs
-					.groupBy(_.portType)
-					.map(_._2.head)
-					.toSeq
-					.sortBy(out => (outputPortPriority(out.portType), out.portType))
-
-				val groups =
-					if (isNonLastEndpoint && ordered.size > 1) Seq(ordered)
-					else if (ordered.size > 2) ordered.grouped(2).filter(_.size > 1).toSeq
-					else Seq.empty
-
-				groups.map { group =>
-					val widths = group.map(_.bitWidth)
-					val kernelName = s"StreamSplitter_${widths.mkString("_")}"
-					instanceCounterByKernel(kernelName) += 1
-					val instanceName = s"${kernelName}_${instanceCounterByKernel(kernelName)}"
-
-						StreamSplitterDef(
-							kernelName = kernelName,
-							instanceName = instanceName,
-							taskName = taskName,
-							peIndex = peIndex,
-							aieEndpointName = endpointName,
-							aiePortType = group.map(_.portType).mkString("_"),
-							outputPortTypes = group.map(_.portType),
-							outputWidths = widths
-						)
-				}
-			}
 	}
 
 	private def collectTaskOutputs(descriptor: FullSysGenDescriptor): Seq[TaskOutputDef] = {
